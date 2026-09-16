@@ -1,0 +1,18 @@
+{
+  "name": "vpet-agent",
+  "private": true,
+  "version": "0.0.1",
+  "description": "VPet 重构：有身体的 Personal Agent（Tauri 2 + React + Rust core + TS brain）",
+  "packageManager": "pnpm@12.4.2",
+  "scripts": {
+    "build:assets": "node scripts/build-assets.mjs",
+    "dev": "pnpm --filter @vpet/desktop tauri dev",
+    "build": "pnpm --filter @vpet/desktop tauri build",
+    "web": "pnpm --filter @vpet/desktop dev",
+    "typecheck": "pnpm -r --if-present typecheck"
+  },
+  "devDependencies": {
+    "sharp": "^0.34.3",
+    "typescript": "^5.9.2"
+  }
+}
