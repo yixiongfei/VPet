@@ -72,6 +72,7 @@ pub struct Db {
 
 impl Db {
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
+        Self::register_vec_extension();
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -84,11 +85,32 @@ impl Db {
 
     #[cfg(test)]
     pub fn open_in_memory() -> rusqlite::Result<Self> {
+        Self::register_vec_extension();
         let db = Self {
             conn: Connection::open_in_memory()?,
         };
         db.init()?;
         Ok(db)
+    }
+
+    /// 把 sqlite-vec 注册成自动扩展。**必须在任何连接建立之前调用一次**，
+    /// 之后打开的每个连接才带 `vec0`。放在这里而不是 `open()` 里，是因为
+    /// `sqlite3_auto_extension` 是进程级的全局状态，重复注册没意义
+    pub fn register_vec_extension() {
+        use std::sync::Once;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| unsafe {
+            // 这段 unsafe 是 sqlite-vec 的既定用法：把 C 的初始化函数指针交给
+            // SQLite。transmute 只是在两种等价的 C 函数签名之间转换
+            let _ = rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<
+                *const (),
+                unsafe extern "C" fn(
+                    *mut rusqlite::ffi::sqlite3,
+                    *mut *mut i8,
+                    *const rusqlite::ffi::sqlite3_api_routines,
+                ) -> i32,
+            >(sqlite_vec::sqlite3_vec_init as *const ())));
+        });
     }
 
     fn init(&self) -> rusqlite::Result<()> {
@@ -273,6 +295,123 @@ impl Db {
         Ok(())
     }
 
+    /* ---------- 向量索引（sqlite-vec） ----------
+     *
+     * 这张表**不是真相来源**，只是加速器：删掉它、换个模型重建，记忆一条不少。
+     * 所以它不进 MIGRATIONS——迁移是只增不改的，而这张表的**宽度取决于模型维度**，
+     * 换模型就得重建。用「按需建表 + 维度写在 kv 里」比硬塞进迁移序列诚实得多。
+     */
+
+    /// 确保向量表存在，且宽度/模型和当前的一致。不一致就整张重建——
+    /// 不同模型的向量在同一个空间里比较是没有意义的，留着比删了更危险
+    pub fn ensure_vec_table(&self, dim: usize, version: &str) -> rusqlite::Result<bool> {
+        // 宽度要拼进 SQL（虚拟表的列宽不能用占位符），所以先验一遍，别让它成为注入口
+        if dim == 0 || dim > 8192 {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "维度 {dim} 不合理"
+            )));
+        }
+        let want = format!("{version}/{dim}");
+        let have = self.take("vec_meta")?;
+        let exists: bool = self.conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'vec_memories'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )? > 0;
+        if exists && have.as_deref() == Some(want.as_str()) {
+            return Ok(false);
+        }
+        log::info!("重建向量索引：{:?} → {want}", have);
+        self.conn.execute_batch(&format!(
+            "DROP TABLE IF EXISTS vec_memories;
+             CREATE VIRTUAL TABLE vec_memories USING vec0(
+                 memory_id TEXT PRIMARY KEY,
+                 embedding float[{dim}] distance_metric=cosine
+             );"
+        ))?;
+        // 旧向量作废，把所有条目的版本清空，后台会重新算
+        self.conn
+            .execute("UPDATE memory_items SET embedding_version = ''", [])?;
+        self.put("vec_meta", &want)?;
+        Ok(true)
+    }
+
+    /// 把所有条目的向量版本清空，逼后台重算一遍。
+    /// 用在「我怀疑索引和记忆对不上」的手动重建路径上
+    pub fn clear_embedding_versions(&self) -> rusqlite::Result<()> {
+        self.conn
+            .execute("UPDATE memory_items SET embedding_version = ''", [])?;
+        self.conn.execute("DELETE FROM vec_memories", [])?;
+        Ok(())
+    }
+
+    pub fn has_vec_table(&self) -> bool {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'vec_memories'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n > 0)
+            .unwrap_or(false)
+    }
+
+    /// 存一条向量，并把这条记忆标成「已按 version 算过」。
+    /// 两件事必须一起成功——否则会出现「版本说算过了但索引里没有」这种查不出来的洞
+    pub fn put_embedding(&self, id: &str, v: &[f32], version: &str) -> rusqlite::Result<()> {
+        let bytes: &[u8] = bytemuck::cast_slice(v);
+        self.conn.execute("DELETE FROM vec_memories WHERE memory_id = ?1", [id])?;
+        self.conn.execute(
+            "INSERT INTO vec_memories(memory_id, embedding) VALUES (?1, ?2)",
+            rusqlite::params![id, bytes],
+        )?;
+        self.conn.execute(
+            "UPDATE memory_items SET embedding_version = ?2 WHERE id = ?1",
+            rusqlite::params![id, version],
+        )?;
+        Ok(())
+    }
+
+    /// 删向量。docs §4.5 明写了「忘记」要**从向量索引中删除**——
+    /// 记忆表里留一行当审计是可以的，但它不能再被检索到，两件事不冲突
+    pub fn delete_embedding(&self, id: &str) -> rusqlite::Result<()> {
+        self.conn.execute("DELETE FROM vec_memories WHERE memory_id = ?1", [id])?;
+        self.conn.execute(
+            "UPDATE memory_items SET embedding_version = '' WHERE id = ?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
+    /// 最近邻。返回 (记忆 id, 余弦)。
+    /// 建表时声明了 `distance_metric=cosine`，vec0 给的 distance = 1 − cos
+    pub fn knn(&self, q: &[f32], k: usize) -> rusqlite::Result<Vec<(String, f32)>> {
+        if !self.has_vec_table() || q.is_empty() {
+            return Ok(Vec::new());
+        }
+        let bytes: &[u8] = bytemuck::cast_slice(q);
+        let mut st = self.conn.prepare(
+            "SELECT memory_id, distance FROM vec_memories
+             WHERE embedding MATCH ?1 AND k = ?2
+             ORDER BY distance",
+        )?;
+        let rows = st.query_map(rusqlite::params![bytes, k as i64], |r| {
+            let id: String = r.get(0)?;
+            let d: f64 = r.get(1)?;
+            Ok((id, (1.0 - d) as f32))
+        })?;
+        rows.collect()
+    }
+
+    /// 还没按当前模型算过向量的活跃记忆。后台补算就照着这个名单来
+    pub fn memories_needing_embedding(&self, version: &str) -> rusqlite::Result<Vec<MemoryItem>> {
+        Ok(self
+            .all_memories()?
+            .into_iter()
+            .filter(|m| m.status == Status::Active && m.embedding_version != version)
+            .collect())
+    }
+
     pub fn save_scheduler(&self, s: &Scheduler) -> rusqlite::Result<()> {
         let json = serde_json::to_string(s)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
@@ -426,6 +565,105 @@ mod tests {
             "删掉的记忆还在进上下文"
         );
         assert!(render_context(&retrieve(&after, "白天学习", &r, now, TOP_K)).is_empty());
+    }
+
+    /* ---------- 向量索引 ---------- */
+
+    fn unit(v: [f32; 4]) -> Vec<f32> {
+        let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        v.iter().map(|x| x / n).collect()
+    }
+
+    #[test]
+    fn 向量表能建能查_余弦方向对() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(db.ensure_vec_table(4, "test-v1").unwrap(), "第一次应当是新建");
+        assert!(!db.ensure_vec_table(4, "test-v1").unwrap(), "同版本同维度不该重建");
+
+        for (id, v) in [("a", [1.0, 0.0, 0.0, 0.0]), ("b", [0.0, 1.0, 0.0, 0.0]),
+                        ("c", [0.9, 0.1, 0.0, 0.0])] {
+            db.put_memory(&mem(id, id)).unwrap();
+            db.put_embedding(id, &unit(v), "test-v1").unwrap();
+        }
+        let hits = db.knn(&unit([1.0, 0.0, 0.0, 0.0]), 3).unwrap();
+        assert_eq!(hits[0].0, "a");
+        assert!((hits[0].1 - 1.0).abs() < 1e-3, "自己和自己的余弦不是 1：{}", hits[0].1);
+        assert_eq!(hits[1].0, "c", "排序不对：{hits:?}");
+        assert!(hits[2].1 < 0.1, "正交的余弦该接近 0：{}", hits[2].1);
+    }
+
+    #[test]
+    fn 换模型或换维度会整张重建并清空版本号() {
+        let db = Db::open_in_memory().unwrap();
+        db.ensure_vec_table(4, "old-v1").unwrap();
+        db.put_memory(&mem("a", "甲")).unwrap();
+        db.put_embedding("a", &unit([1.0, 0.0, 0.0, 0.0]), "old-v1").unwrap();
+        assert_eq!(db.all_memories().unwrap()[0].embedding_version, "old-v1");
+
+        // 不同模型的向量在同一个空间里比较没有意义，留着比删了更危险
+        assert!(db.ensure_vec_table(8, "new-v1").unwrap(), "维度变了却没重建");
+        assert!(db.knn(&vec![0.0; 8], 5).unwrap().is_empty(), "旧向量没清掉");
+        assert_eq!(
+            db.all_memories().unwrap()[0].embedding_version, "",
+            "版本号没清空，后台就不会去重算"
+        );
+    }
+
+    #[test]
+    fn 待补算的名单只含活跃且版本不符的() {
+        let db = Db::open_in_memory().unwrap();
+        db.ensure_vec_table(4, "v1").unwrap();
+        db.put_memory(&mem("a", "甲")).unwrap();
+        db.put_memory(&mem("b", "乙")).unwrap();
+        let mut gone = mem("c", "丙");
+        gone.status = Status::Deleted;
+        db.put_memory(&gone).unwrap();
+
+        db.put_embedding("a", &unit([1.0, 0.0, 0.0, 0.0]), "v1").unwrap();
+        let todo = db.memories_needing_embedding("v1").unwrap();
+        let ids: Vec<&str> = todo.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["b"], "名单不对：{ids:?}");
+    }
+
+    #[test]
+    fn 忘记要把向量也删掉() {
+        let db = Db::open_in_memory().unwrap();
+        db.ensure_vec_table(4, "v1").unwrap();
+        db.put_memory(&mem("a", "甲")).unwrap();
+        let v = unit([1.0, 0.0, 0.0, 0.0]);
+        db.put_embedding("a", &v, "v1").unwrap();
+        assert_eq!(db.knn(&v, 5).unwrap().len(), 1);
+
+        // docs §4.5：忘记 = 标记删除 + 从向量索引中删除
+        db.set_memory_status("a", Status::Deleted, 0).unwrap();
+        db.delete_embedding("a").unwrap();
+        assert!(db.knn(&v, 5).unwrap().is_empty(), "删了还能被最近邻召回");
+        assert_eq!(db.all_memories().unwrap().len(), 1, "行要留着当审计");
+    }
+
+    #[test]
+    fn 重复写同一条向量是覆盖不是堆积() {
+        let db = Db::open_in_memory().unwrap();
+        db.ensure_vec_table(4, "v1").unwrap();
+        db.put_memory(&mem("a", "甲")).unwrap();
+        db.put_embedding("a", &unit([1.0, 0.0, 0.0, 0.0]), "v1").unwrap();
+        db.put_embedding("a", &unit([0.0, 1.0, 0.0, 0.0]), "v1").unwrap();
+        let hits = db.knn(&unit([0.0, 1.0, 0.0, 0.0]), 5).unwrap();
+        assert_eq!(hits.len(), 1, "同一条记忆在索引里有两份");
+        assert!((hits[0].1 - 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn 没建表时最近邻返回空而不是报错() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(db.knn(&[1.0, 0.0], 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn 荒唐的维度会被挡住() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(db.ensure_vec_table(0, "v").is_err());
+        assert!(db.ensure_vec_table(99999, "v").is_err());
     }
 
     #[test]

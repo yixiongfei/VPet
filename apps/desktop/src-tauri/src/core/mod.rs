@@ -4,9 +4,11 @@
 pub mod actions;
 pub mod bias;
 pub mod db;
+pub mod embed;
 pub mod food;
 pub mod memory;
 pub mod obey;
+pub mod pipeline_test;
 pub mod pomodoro;
 pub mod scheduler;
 pub mod state_machine;

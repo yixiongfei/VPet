@@ -141,10 +141,18 @@ export const MemoryItem = z.object({
 })
 export type MemoryItem = z.infer<typeof MemoryItem>
 
-/** 一次检索命中。`similarity` 和 `score` 都带出来，是为了排序能被人检查 */
+/**
+ * 一次检索命中。三个分数都带出来，是为了排序能被人检查——
+ * 融合的黑盒不给人看就成了玄学。
+ * `lexical` 是字面（字符 n-gram 余弦），`dense` 是语义（向量最近邻），
+ * `similarity` 是两者的加权和，也就是打分公式里的那一项。
+ */
 export const MemoryHit = z.object({
   item: MemoryItem,
   similarity: z.number().min(0).max(1),
+  lexical: z.number().min(0).max(1),
+  /** null = 这条不在向量最近邻里，或者模型没就绪 */
+  dense: z.number().min(0).max(1).nullish(),
   score: z.number(),
 })
 export type MemoryHit = z.infer<typeof MemoryHit>
@@ -160,3 +168,17 @@ export const MemoryHealth = z.object({
   needsSweep: z.number().int(),
 })
 export type MemoryHealth = z.infer<typeof MemoryHealth>
+
+/**
+ * 语义模型的状态。**悄悄降级是最坏的一种降级**——
+ * 用户得能看到「现在到底在用哪种检索」。
+ */
+export const EmbedState = z.discriminatedUnion('state', [
+  /** 没配模型，纯字面检索 */
+  z.object({ state: z.literal('disabled'), reason: z.string() }),
+  z.object({ state: z.literal('loading') }),
+  z.object({ state: z.literal('ready'), name: z.string(), dim: z.number().int() }),
+  /** 试过了起不来，带上原因 */
+  z.object({ state: z.literal('failed'), reason: z.string() }),
+])
+export type EmbedState = z.infer<typeof EmbedState>

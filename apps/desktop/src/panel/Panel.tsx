@@ -90,6 +90,20 @@ const MEM_STATUS_COLOR: Record<MemoryRow['status'], string> = {
 
 const ymd = (ms: number) => new Date(ms).toISOString().slice(0, 10)
 
+type EmbedState =
+  | { state: 'disabled'; reason: string }
+  | { state: 'loading' }
+  | { state: 'ready'; name: string; dim: number }
+  | { state: 'failed'; reason: string }
+
+interface MemHit {
+  item: MemoryRow
+  similarity: number
+  lexical: number
+  dense: number | null
+  score: number
+}
+
 interface BiasRow {
   tag: string
   weight: number
@@ -128,6 +142,8 @@ export function Panel() {
   const [memHealth, setMemHealth] = useState<MemoryHealth | null>(null)
   const [memQuery, setMemQuery] = useState('')
   const [memCtx, setMemCtx] = useState('')
+  const [memHits, setMemHits] = useState<MemHit[]>([])
+  const [embed, setEmbed] = useState<EmbedState | null>(null)
 
   useEffect(() => {
     void invokeCore<string>('app_version').then((v) => v && setVersion(v))
@@ -139,6 +155,7 @@ export function Panel() {
       void invokeCore<BiasRow[]>('list_biases').then((b) => b && setBiases(b))
       void invokeCore<MemoryRow[]>('list_memories').then((m) => m && setMems(m))
       void invokeCore<MemoryHealth>('memory_health').then(setMemHealth)
+      void invokeCore<EmbedState>('get_embed_state').then(setEmbed)
     }
     pull()
     const timer = window.setInterval(pull, REFRESH_MS)
@@ -159,10 +176,18 @@ export function Panel() {
   const memPin = (id: string, pinned: boolean) =>
     void invokeCore('pin_memory', { id, pinned }).then(pullMems)
   /** 预览「这个问题会带上哪些记忆」——排序的黑盒不给人看就成了玄学 */
-  const previewCtx = () =>
+  const previewCtx = () => {
     void invokeCore<string>('memory_context', { query: memQuery }).then((c) => {
       setMemCtx(c ?? '')
       pullMems()
+    })
+    // 同时把每条的字面分 / 语义分拉出来——看得见是哪一路召回的，才调得动
+    void invokeCore<MemHit[]>('search_memory', { query: memQuery }).then((h) => setMemHits(h ?? []))
+  }
+  const rebuildIndex = () =>
+    void invokeCore<number>('rebuild_embeddings').then(() => {
+      pullMems()
+      void invokeCore<EmbedState>('get_embed_state').then(setEmbed)
     })
   const bias = (tag: string, weight: number) =>
     void invokeCore<BiasRow[]>('set_bias', { tag, weight }).then((b) => b && setBiases(b))
@@ -249,6 +274,31 @@ export function Panel() {
           </Card>
 
           <Card title="她记得什么">
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 8,
+                marginBottom: 12,
+                fontSize: 13,
+                color: '#8a8a93',
+              }}
+            >
+              <span>检索方式：</span>
+              {embed?.state === 'ready' ? (
+                <span style={{ color: '#7cc47f' }}>
+                  语义 + 字面（{embed.name} · {embed.dim} 维）
+                </span>
+              ) : embed?.state === 'loading' ? (
+                <span style={{ color: '#e0a458' }}>模型加载中，暂时只用字面</span>
+              ) : (
+                <span style={{ color: '#e0a458' }}>
+                  只有字面
+                  {embed && 'reason' in embed && `（${embed.reason}）`}
+                </span>
+              )}
+              {embed?.state === 'ready' && <Btn onClick={rebuildIndex}>重建索引</Btn>}
+            </div>
             {memHealth && (
               <p style={{ margin: '0 0 12px', color: '#8a8a93', fontSize: 13 }}>
                 活跃 {memHealth.active} · 归档 {memHealth.archived} · 已删 {memHealth.deleted} ·
@@ -277,6 +327,19 @@ export function Panel() {
               />
               <Btn onClick={previewCtx}>检索</Btn>
             </div>
+            {memHits.length > 0 && (
+              <ul style={{ listStyle: 'none', margin: '0 0 10px', padding: 0, fontSize: 12 }}>
+                {memHits.map((h) => (
+                  <li key={h.item.id} style={{ color: '#8a8a93', marginBottom: 3 }}>
+                    <span style={{ fontVariantNumeric: 'tabular-nums' }}>
+                      总分 {h.score.toFixed(3)} ← 字面 {h.lexical.toFixed(2)} ·{' '}
+                      {h.dense == null ? '语义 —' : `语义 ${h.dense.toFixed(2)}`}
+                    </span>
+                    <span style={{ color: '#e8e8ea', marginLeft: 8 }}>{h.item.content}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
             {memCtx && (
               <pre
                 style={{

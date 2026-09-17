@@ -14,6 +14,18 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[features]
+default = ["embed"]
+# 语义检索。ORT 在编译期下载并静态链接——发布版走这条，用户不用额外装东西
+embed = ["_onnx", "ort/download-binaries"]
+# 同上，但 ORT 在运行期从 ORT_DYLIB_PATH 动态加载。
+# 编译期零下载，所以 CI / 离线环境用这条验证：
+#   cargo test --no-default-features --features embed-dynamic
+embed-dynamic = ["_onnx", "ort/load-dynamic"]
+# 内部用。`dep:ort` 会抑制同名的隐式 feature，所以 `#[cfg(feature = "ort")]`
+# 永远为假、onnx 模块会被静默编掉——必须另起一个名字给 cfg 用
+_onnx = ["dep:ort", "dep:tokenizers"]
+
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-global-shortcut = "2"
@@ -24,6 +36,12 @@ env_logger = "0.11"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 toml = "1.1.6"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+# 向量索引。只是加速器——真相在 memory_items 表里，这张表随时能重建
+sqlite-vec = "0.1.9"
+bytemuck = "1"
+# 语义检索的两半：ONNX 推理 + 分词。都是可选的，没有就退回字面检索
+ort = { version = "2.0.0-rc.13", default-features = false, optional = true }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"], optional = true }
 
 [profile.release]
 codegen-units = 1

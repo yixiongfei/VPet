@@ -20,10 +20,14 @@ use core::tools::{
     PermissionGate, ToolCall, ToolDef, ToolResult,
 };
 use core::bias::{BiasView, DEFAULT_HALF_LIFE};
+use core::embed::EmbedState;
+#[cfg(feature = "_onnx")]
+use core::embed::Embedder;
 use core::memory::{
     self, BigramRetriever, Command, Health, Hit, MemoryItem, MemoryType, Retriever, Source, Status,
     WriteOutcome,
 };
+use std::collections::HashMap;
 use core::obey::Verdict;
 use core::state_machine::{catch_up, reduce, Event, Pet, PetState, Touch};
 
@@ -362,6 +366,199 @@ fn retriever() -> BigramRetriever {
     BigramRetriever
 }
 
+/* ---------- 语义向量：加载、补算、检索 ---------- */
+
+/// 没开 `embed` feature 时的占位：整套语义检索就是不存在，
+/// 其余功能一行都不用改——降级必须是**结构上的**，不是靠运行时判断到处打补丁
+#[cfg(not(feature = "_onnx"))]
+type SharedEmbedder = ();
+#[cfg(feature = "_onnx")]
+type SharedEmbedder = std::sync::Arc<Embedder>;
+
+#[derive(Default)]
+struct EmbedSlot {
+    #[allow(dead_code)]
+    inner: Option<SharedEmbedder>,
+}
+
+fn embed_state(app: &AppHandle) -> EmbedState {
+    app.try_state::<RwLock<EmbedState>>()
+        .and_then(|s| s.read().ok().map(|g| g.clone()))
+        .unwrap_or(EmbedState::Disabled { reason: "未初始化".into() })
+}
+
+fn set_embed_state(app: &AppHandle, st: EmbedState) {
+    if let Some(slot) = app.try_state::<RwLock<EmbedState>>() {
+        if let Ok(mut g) = slot.write() {
+            *g = st.clone();
+        }
+    }
+    let _ = app.emit("embed:state", st);
+}
+
+#[cfg(feature = "_onnx")]
+fn embedder(app: &AppHandle) -> Option<SharedEmbedder> {
+    app.try_state::<RwLock<EmbedSlot>>()
+        .and_then(|s| s.read().ok().and_then(|g| g.inner.clone()))
+}
+
+#[cfg(not(feature = "_onnx"))]
+fn embedder(_app: &AppHandle) -> Option<SharedEmbedder> {
+    None
+}
+
+/// 后台加载模型。**绝不能挡着宠物出现在桌面上**——
+/// 几十 MB 的模型冷启动要几百毫秒到几秒，那段时间里字面检索照常工作
+#[cfg(feature = "_onnx")]
+fn spawn_embed_loader(app: AppHandle) {
+    let dir = match app.path().app_data_dir() {
+        Ok(d) => core::embed::model_dir(&d),
+        Err(e) => {
+            set_embed_state(&app, EmbedState::Disabled { reason: format!("取不到数据目录：{e}") });
+            return;
+        }
+    };
+    if !core::embed::looks_ready(&dir) {
+        set_embed_state(
+            &app,
+            EmbedState::Disabled {
+                reason: format!("{} 下没有 model.onnx / tokenizer.json", dir.display()),
+            },
+        );
+        return;
+    }
+    set_embed_state(&app, EmbedState::Loading);
+    std::thread::spawn(move || {
+        let t0 = Instant::now();
+        match Embedder::load(&dir) {
+            Ok(e) => {
+                let (name, dim) = (e.version().to_string(), e.dim());
+                log::info!("语义模型就绪：{name}（{dim} 维，{} ms）", t0.elapsed().as_millis());
+                // 建/重建向量表要在放进 slot 之前——否则补算会写进一张宽度不对的表
+                let rebuilt = match app.try_state::<Mutex<Db>>() {
+                    Some(db) => db
+                        .lock()
+                        .ok()
+                        .and_then(|d| d.ensure_vec_table(dim, &name).ok())
+                        .unwrap_or(false),
+                    None => false,
+                };
+                if let Some(slot) = app.try_state::<RwLock<EmbedSlot>>() {
+                    if let Ok(mut g) = slot.write() {
+                        g.inner = Some(std::sync::Arc::new(e));
+                    }
+                }
+                set_embed_state(&app, EmbedState::Ready { name, dim });
+                if rebuilt {
+                    log::info!("向量索引已重建，开始补算");
+                }
+                backfill_embeddings(&app);
+            }
+            Err(e) => {
+                log::warn!("语义模型加载失败，退回字面检索：{e}");
+                set_embed_state(&app, EmbedState::Failed { reason: e });
+            }
+        }
+    });
+}
+
+#[cfg(not(feature = "_onnx"))]
+fn spawn_embed_loader(app: AppHandle) {
+    set_embed_state(&app, EmbedState::Disabled { reason: "这个构建没有编进语义检索".into() });
+}
+
+/// 把还没算过向量的活跃记忆补上。分批做，别一口气把几千条塞进一次推理
+#[cfg(feature = "_onnx")]
+fn backfill_embeddings(app: &AppHandle) -> usize {
+    const BATCH: usize = 16;
+    let Some(e) = embedder(app) else { return 0 };
+    let Some(db) = app.try_state::<Mutex<Db>>() else { return 0 };
+    let version = e.version().to_string();
+    let todo = {
+        let Ok(d) = db.lock() else { return 0 };
+        d.memories_needing_embedding(&version).unwrap_or_default()
+    };
+    if todo.is_empty() {
+        return 0;
+    }
+    let mut done = 0;
+    for chunk in todo.chunks(BATCH) {
+        let texts: Vec<&str> = chunk.iter().map(|m| m.content.as_str()).collect();
+        let Ok(vecs) = e.embed_batch(&texts) else { break };
+        let Ok(d) = db.lock() else { break };
+        for (m, v) in chunk.iter().zip(vecs) {
+            if d.put_embedding(&m.id, &v, &version).is_ok() {
+                done += 1;
+            }
+        }
+    }
+    if done > 0 {
+        log::info!("补算了 {done} 条记忆的向量");
+        let _ = app.emit("embed:backfilled", done);
+    }
+    done
+}
+
+#[cfg(not(feature = "_onnx"))]
+fn backfill_embeddings(_app: &AppHandle) -> usize {
+    0
+}
+
+/// 一条记忆写进去之后，顺手把向量也更新掉。
+/// 失败不抛——记忆已经安全落库了，向量算不出来只是暂时检索不到它，
+/// 下一次补算会捡回来
+#[cfg(feature = "_onnx")]
+fn embed_one_memory(app: &AppHandle, m: &MemoryItem) {
+    let Some(e) = embedder(app) else { return };
+    let Ok(v) = e.embed_one(&m.content) else { return };
+    if let Some(db) = app.try_state::<Mutex<Db>>() {
+        if let Ok(d) = db.lock() {
+            let _ = d.put_embedding(&m.id, &v, e.version());
+        }
+    }
+}
+
+#[cfg(not(feature = "_onnx"))]
+fn embed_one_memory(_app: &AppHandle, _m: &MemoryItem) {}
+
+/// 向量最近邻。模型没就绪就返回 None——调用方据此退回纯字面检索
+#[cfg(feature = "_onnx")]
+fn dense_candidates(app: &AppHandle, query: &str) -> Option<HashMap<String, f32>> {
+    let e = embedder(app)?;
+    let q = e.embed_query(query).ok()?;
+    let db = app.try_state::<Mutex<Db>>()?;
+    let d = db.lock().ok()?;
+    let hits = d.knn(&q, memory::KNN_CANDIDATES).ok()?;
+    Some(hits.into_iter().collect())
+}
+
+#[cfg(not(feature = "_onnx"))]
+fn dense_candidates(_app: &AppHandle, _query: &str) -> Option<HashMap<String, f32>> {
+    None
+}
+
+/// 现在到底在用哪种检索。悄悄降级是最坏的一种降级，所以这个要能被看到
+#[tauri::command]
+fn get_embed_state(app: AppHandle) -> EmbedState {
+    embed_state(&app)
+}
+
+/// 手动重建向量索引。换了模型、或者怀疑索引和记忆对不上时用
+#[tauri::command]
+fn rebuild_embeddings(app: AppHandle) -> usize {
+    #[cfg(feature = "_onnx")]
+    {
+        if let (Some(e), Some(db)) = (embedder(&app), app.try_state::<Mutex<Db>>()) {
+            if let Ok(d) = db.lock() {
+                // 传一个空版本号，逼它整张重建
+                let _ = d.ensure_vec_table(e.dim(), e.version());
+                let _ = d.clear_embedding_versions();
+            }
+        }
+    }
+    backfill_embeddings(&app)
+}
+
 fn memories(app: &AppHandle) -> Vec<MemoryItem> {
     let Some(db) = app.try_state::<Mutex<Db>>() else { return Vec::new() };
     db.lock()
@@ -427,6 +624,9 @@ fn remember(
         let Ok(db) = db.lock() else { return Err("数据库被占住了".into()) };
         db.put_memory(item).map_err(|e| e.to_string())?;
         log::info!("记住了：{}（{}）", item.content, item.kind.as_str());
+        drop(db);
+        // 内容变了，旧向量就作废了。更新路径尤其要注意这点
+        embed_one_memory(&app, item);
     }
     Ok(outcome)
 }
@@ -455,6 +655,9 @@ fn forget_memory(app: AppHandle, query: String) -> Option<MemoryItem> {
     let db = app.try_state::<Mutex<Db>>()?;
     let d = db.lock().ok()?;
     d.set_memory_status(&target.id, Status::Deleted, now).ok()?;
+    // docs §4.5：忘记要**从向量索引中删除**。记忆表留一行当审计不冲突——
+    // 那一行再也不会被任何检索路径召回
+    let _ = d.delete_embedding(&target.id);
     log::info!("忘掉了：{}", target.content);
     Some(target)
 }
@@ -465,7 +668,16 @@ fn forget_memory(app: AppHandle, query: String) -> Option<MemoryItem> {
 fn search_memory(app: AppHandle, query: String, limit: Option<usize>) -> Vec<Hit> {
     let now = now_ms();
     let k = limit.unwrap_or(memory::TOP_K).min(20);
-    let hits = memory::retrieve(&memories(&app), &query, &retriever(), now, k);
+    // 稠密候选拿不到（没模型 / 还在加载 / 加载失败）就退回纯字面，不报错
+    let dense = dense_candidates(&app, &query);
+    let hits = memory::retrieve_hybrid(
+        &memories(&app),
+        &query,
+        &retriever(),
+        dense.as_ref(),
+        now,
+        k,
+    );
     if let Some(db) = app.try_state::<Mutex<Db>>() {
         if let Ok(d) = db.lock() {
             let ids: Vec<String> = hits.iter().map(|h| h.item.id.clone()).collect();
@@ -1027,12 +1239,16 @@ pub fn run() {
             app.manage(Mutex::new(PermissionGate::default()));
             app.manage(Mutex::new(AuditLog::default()));
             app.manage(Mutex::new(restored));
+            app.manage(RwLock::new(EmbedSlot::default()));
+            app.manage(RwLock::new(EmbedState::Disabled { reason: "还没开始加载".into() }));
             if let Some(win) = app.get_webview_window(PET_WINDOW) {
                 place_bottom_right(&win);
             }
             build_tray(app.handle())?;
             spawn_hit_test(app.handle().clone());
             spawn_pet_clock(app.handle().clone());
+            // 语义模型后台加载：几十 MB 的东西不能挡着宠物出现在桌面上
+            spawn_embed_loader(app.handle().clone());
             if let Err(e) = register_prompt_shortcut(app.handle()) {
                 // 快捷键被别的程序占了不该拖垮启动，双击宠物一样能呼出输入框
                 log::warn!("注册全局快捷键 {PROMPT_SHORTCUT} 失败: {e}");
@@ -1071,7 +1287,9 @@ pub fn run() {
             memory_health,
             pin_memory,
             set_memory_status,
-            set_memory_importance
+            set_memory_importance,
+            get_embed_state,
+            rebuild_embeddings
         ])
         .build(tauri::generate_context!())
         .expect("VPet 启动失败")

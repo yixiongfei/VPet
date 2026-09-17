@@ -60,7 +60,8 @@ Phase 8  打磨与发布            ─  v4
 | 2.6 Secrets | ⬜ 等 Phase 3 真的要用 API key 时再做——现在没有任何东西需要密钥，提前建一个空的密钥库只是摆设 |
 | 2.7 命令与事件面 | 🚧 已有 `pet:state` `pet:said` `pet:prompt` `timer:fired` `pomodoro:tick` `pomodoro:phase` `tool:confirm` `audit:appended`。`agent:trigger` 等 Phase 6 的 Observer；`build_context` / `session_append` / `memory_upsert` 等 Brain 和记忆到位 |
 | 2.8 服从与好感度 | ✅ 用户的要求不是命令，是一次概率判定。`affection`（好感度，天级慢变量）进 `PetState`；`obey::judge` 用对数几率模型算服从概率 `σ(基线 + 好感 + 心情 − 生理冲突 − 动作代价 − 压力)`；拒绝理由取冲突最大的那一项，一一对应固定台词。`request_action(target)` 是**唯一一处用户意志进入状态机的入口**，进来立刻降格成一次掷骰。被拒后反复施压会掉心情和好感 |
-| 2.11 长期互动记忆 | ✅ `memory_items` 表（迁移 v3）是**唯一真相来源**，向量索引只是加速器。六种类型（profile/preference/habit/temporary_context/relationship/commitment），五项加权排序（语义 .55 + 重要性 .20 + 新鲜度 .10 + 使用频次 .10 + 置信度 .05），冲突按来源优先级消解。**推断不能当事实**——`plan_write` 对 `Inferred` 只回 `NeedsConfirm`，类型上就堵死了；敏感内容同理。软删除（行留着当审计，但检索入口按 status 过滤）。相似度是 `Retriever` trait，现在是零依赖的字符 n-gram，Phase 4 接 `fastembed` 时原地换。**sqlite-vec 等条目上万再说**：几百条全表余弦是微秒级 |
+| 2.11 长期互动记忆 | ✅ 详见 [09-memory-and-retrieval.md](09-memory-and-retrieval.md)。`memory_items` 表（迁移 v3）是**唯一真相来源**，向量索引只是加速器。六种类型（profile/preference/habit/temporary_context/relationship/commitment），五项加权排序（语义 .55 + 重要性 .20 + 新鲜度 .10 + 使用频次 .10 + 置信度 .05），冲突按来源优先级消解。**推断不能当事实**——`plan_write` 对 `Inferred` 只回 `NeedsConfirm`，类型上就堵死了；敏感内容同理。软删除（行留着当审计，但检索入口按 status 过滤）。相似度是字面 + 语义的混合（见 2.12） |
+| 2.12 语义检索 + 向量索引 | ✅ 本地 ONNX 句向量（`ort` + `tokenizers`，**不用 fastembed**——那会拖进 hf-hub 和 TLS 栈，还强依赖 HuggingFace 可达）+ sqlite-vec `vec0` 虚拟表。模型完全可选：后台加载，缺了就退回字面检索，面板显示当前用哪种。融合是加权和（两路都是余弦，不需要 RRF），稠密侧的门槛是「在不在 KNN 结果里」而非绝对阈值——句向量有各向异性，绝对阈值会把所有东西放进来。换模型自动重建索引并补算 |
 | 2.9 自然语言控制 | ⬜ 把中文翻译成 `request_action` / `set_bias` 的调用。三层递进：① `intents.toml` 规则表 ② char-bigram 余弦近邻（穷人的 embedding，零依赖） ③ 本地 embedding 模型兜长尾（复用 Phase 4 的 `fastembed`，不另引依赖）。**NLU 只是工具层的前端**——Phase 3 的 LLM 调的是同一组工具 |
 | 2.10 偏好权重 Bias | ✅ 「多工作一点」= 给 tag 加一个带半衰期的权重（默认 120 分钟）。**不是**优先级阶梯上的新一级：它只在「作息」那层里重排 work/study/play 三条道、让正偏置越出时段，排不过「生理急需」，也排不过「到点该睡该吃」。吃喝睡不可压制（`SUPPRESSIBLE` 白名单）——「少吃点」不该把她饿死。`set_bias` / `clear_bias` / `list_biases` |
 
@@ -84,9 +85,9 @@ Phase 8  打磨与发布            ─  v4
 
 | 任务 | 说明 |
 |---|---|
-| 4.0 Spike | `fastembed` crate 跑 `bge-m3`（或 `multilingual-e5-base`）：确认模型可用、维度、CPU 速度、包体积；半天 |
-| 4.1 EmbeddingProvider | **本地进程内 `fastembed`**（Q7 已确认）；接口留 Ollama / OpenAI 作可选 |
-| 4.2 sqlite-vec + FTS5 | `memories` / `note_chunks` 两套表；RRF 混合检索；`privacy` 列 |
+| 4.0 Spike | ~~fastembed~~ ✅ 已在 2.12 做掉，但结论不同：直接用 `ort` + `tokenizers`，模型放本地目录。见 [09](09-memory-and-retrieval.md) §5.3 |
+| 4.1 EmbeddingProvider | ✅ 已在 2.12 落地（`core/embed.rs`）。接口留了 `embed.json` 配置池化方式和查询前缀，换模型只换目录 |
+| 4.2 sqlite-vec + FTS5 | 🚧 `vec_memories` 已在 2.12 建好；`note_chunks`（笔记分块）和 `privacy` 列等 Obsidian 索引开工时再加。FTS5 暂时用字符 n-gram 顶替——记忆是短摘要，够用 |
 | 4.3 Vault Indexer | 分块规则（04 §4.2）；`notify` 增量；`embedding_model` 不一致时重建；按目录规则打 `privacy` 标 |
 | 4.3b 隐私路由 | ContextBuilder：目标 provider 为云端时剔除 `local_only` 块（Q15） |
 | 4.4 MemoryExtractor | extract 路由；结构化输出；`superseded_by` 链 |

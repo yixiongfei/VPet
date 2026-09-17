@@ -326,8 +326,32 @@ pub fn score(item: &MemoryItem, similarity: f32, now: i64) -> f32 {
 #[serde(rename_all = "camelCase")]
 pub struct Hit {
     pub item: MemoryItem,
+    /// 融合后的语义相似度，就是打分公式里的那一项
     pub similarity: f32,
+    /// 字面相似度（字符 n-gram 余弦）。单独留着是为了能在面板上看到
+    /// 「这条是靠字面命中的还是靠语义命中的」——融合的黑盒不给人看就成了玄学
+    pub lexical: f32,
+    /// 稠密相似度。`None` = 这条不在向量检索的候选里，或者模型没就绪
+    pub dense: Option<f32>,
     pub score: f32,
+}
+
+/// 两路融合的权重。**加权和而不是 RRF**：
+///
+/// RRF 的长处是能融合量纲不同的分数（BM25 是无界的，余弦有界），这里两路都是
+/// 余弦，直接加权更简单、更可解释，而且保住了 `[0,1]` 的语义——
+/// `MIN_SIMILARITY` 和 `CONFLICT_SIM` 这两个绝对阈值都依赖它。
+const DENSE_W: f32 = 0.7;
+
+/// 向量检索取多少个候选。取得比 TOP_K 宽，是因为最终排序还要过重要性、
+/// 新鲜度、冲突消解——只召回 5 个再排序，等于让语义单方面决定了结果
+pub const KNN_CANDIDATES: usize = 24;
+
+fn fuse(lexical: f32, dense: Option<f32>) -> f32 {
+    match dense {
+        Some(d) => DENSE_W * d + (1.0 - DENSE_W) * lexical,
+        None => lexical,
+    }
 }
 
 /// 检索：过滤 → 打分 → 消解冲突 → 取前 k 条。
@@ -342,18 +366,39 @@ pub fn retrieve(
     now: i64,
     k: usize,
 ) -> Vec<Hit> {
+    retrieve_hybrid(items, query, retr, None, now, k)
+}
+
+/// 混合检索：字面 + 稠密。
+///
+/// `dense` 是向量索引给的 `记忆 id → 余弦`，**只包含最近邻的那一批**。
+/// 「在不在这个表里」本身就是稠密侧的门槛——这比给融合分设一个绝对阈值可靠得多：
+/// 真实句向量模型有各向异性，不相干的两句话余弦也常在 0.6 上下，
+/// 用绝对阈值会把所有东西都放进来。相对排名才是稠密检索唯一可信的信号。
+pub fn retrieve_hybrid(
+    items: &[MemoryItem],
+    query: &str,
+    retr: &dyn Retriever,
+    dense: Option<&HashMap<String, f32>>,
+    now: i64,
+    k: usize,
+) -> Vec<Hit> {
     let mut hits: Vec<Hit> = items
         .iter()
         .filter(|m| m.usable(now))
         .filter_map(|m| {
-            let similarity = retr.similarity(query, &m.content);
-            // 置顶的记忆不管问什么都该在候选里——那是用户明说了「一直记着」
-            if similarity < MIN_SIMILARITY && !m.pinned {
+            let lexical = retr.similarity(query, &m.content);
+            let d = dense.and_then(|map| map.get(&m.id).copied());
+            // 三条入选通道：字面够像、进了向量最近邻、或者用户置顶（明说了「一直记着」）
+            if lexical < MIN_SIMILARITY && d.is_none() && !m.pinned {
                 return None;
             }
+            let similarity = fuse(lexical, d);
             Some(Hit {
                 score: score(m, similarity, now),
                 similarity,
+                lexical,
+                dense: d,
                 item: m.clone(),
             })
         })
@@ -878,6 +923,64 @@ mod tests {
             .map(|i| mk(&format!("m{i}"), &format!("用户在学科目{i}"), MemoryType::Profile, Source::UserExplicit))
             .collect();
         assert!(retrieve(&items, "用户在学什么", &r(), NOW, TOP_K).len() <= TOP_K);
+    }
+
+    /* ---------- 混合检索 ---------- */
+
+    fn dense_of(pairs: &[(&str, f32)]) -> HashMap<String, f32> {
+        pairs.iter().map(|(id, s)| (id.to_string(), *s)).collect()
+    }
+
+    #[test]
+    fn 稠密召回能救回字面够不着的() {
+        // 「作息」和这条记忆零共字，字面检索的结构性天花板
+        let m = mk("h", "用户晚上上班白天学习", MemoryType::Habit, Source::UserExplicit);
+        assert!(retrieve(std::slice::from_ref(&m), "作息", &r(), NOW, TOP_K).is_empty());
+
+        // 向量索引把它捞回来了
+        let dense = dense_of(&[("h", 0.72)]);
+        let hits = retrieve_hybrid(&[m], "作息", &r(), Some(&dense), NOW, TOP_K);
+        assert_eq!(hits.len(), 1, "稠密候选没能进入结果");
+        assert_eq!(hits[0].dense, Some(0.72));
+        assert_eq!(hits[0].lexical, 0.0, "字面确实是 0，这正是它救回来的东西");
+    }
+
+    #[test]
+    fn 融合是加权和且两路都保留() {
+        let m = mk("a", "用户在准备考研", MemoryType::Profile, Source::UserExplicit);
+        let dense = dense_of(&[("a", 1.0)]);
+        let hits = retrieve_hybrid(&[m], "考研", &r(), Some(&dense), NOW, TOP_K);
+        let h = &hits[0];
+        let expect = DENSE_W * 1.0 + (1.0 - DENSE_W) * h.lexical;
+        assert!((h.similarity - expect).abs() < 1e-5, "融合算错了");
+        assert!(h.lexical > 0.0, "字面分数该被保留下来给人看");
+    }
+
+    #[test]
+    fn 没有稠密时行为和以前完全一样() {
+        let m = mk("a", "用户在准备考研", MemoryType::Profile, Source::UserExplicit);
+        let with_none = retrieve_hybrid(std::slice::from_ref(&m), "考研", &r(), None, NOW, TOP_K);
+        let plain = retrieve(&[m], "考研", &r(), NOW, TOP_K);
+        assert_eq!(with_none, plain, "没模型时不该有任何行为变化");
+        assert_eq!(plain[0].dense, None);
+    }
+
+    #[test]
+    fn 稠密候选也要过生命周期这一关() {
+        // 向量索引里可能残留已删除的条目（比如崩溃在两次写之间）。
+        // usable() 是唯一裁决点，稠密召回不能绕过它
+        let mut gone = mk("d", "用户晚上上班", MemoryType::Habit, Source::UserExplicit);
+        gone.status = Status::Deleted;
+        let dense = dense_of(&[("d", 0.99)]);
+        assert!(retrieve_hybrid(&[gone], "作息", &r(), Some(&dense), NOW, TOP_K).is_empty());
+    }
+
+    #[test]
+    fn 稠密高分压不过重要性和新鲜度以外的硬规则() {
+        // 未确认的推断，稠密再像也不进上下文
+        let guess = mk("g", "用户大概喜欢咖啡", MemoryType::Preference, Source::Inferred);
+        let dense = dense_of(&[("g", 0.99)]);
+        assert!(retrieve_hybrid(&[guess], "咖啡", &r(), Some(&dense), NOW, TOP_K).is_empty());
     }
 
     /* ---------- 冲突消解 ---------- */

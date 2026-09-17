@@ -16,11 +16,12 @@
 | 01 | [产品定义与边界](01-vision.md) | 它是什么、不是什么；5 个核心问题的建议答案 |
 | 02 | [能力地图](02-capability-map.md) | 从聊天到人格，一层一层拆出来的能力，以及哪些进 MVP |
 | 03 | [系统架构](03-architecture.md) | Tauri + React + Rust 的模块边界、数据流、Tool 协议、权限模型 |
-| 04 | [Brain：LLM / 记忆 / RAG](04-brain-memory-rag.md) | 模型抽象、Agent 循环、记忆抽取、向量库与 embedding 选型 |
+| 04 | [Brain：LLM / 记忆 / RAG](04-brain-memory-rag.md) | 模型抽象、Agent 循环、记忆抽取、向量库与 embedding 选型（**设计意图**；实现见 09）|
 | 05 | [Body：动画与资产](05-body-assets.md) | 如何复用现有 6181 帧 PNG 动画，渲染器设计，状态→动画映射 |
 | 06 | [集成：知识库 / Obsidian / GitHub / 系统](06-integrations.md) | 每个外部数据源怎么接、接哪些、权限如何 |
 | 07 | [执行路线图](07-roadmap.md) | Phase 0 → Phase 8，每阶段的交付物和完成标准 |
 | 08 | [待确认问题](08-open-questions.md) | 需要你回答的问题，每个都附了我的默认假设 |
+| 09 | [记忆与检索](09-memory-and-retrieval.md) | **已落地的实现**：她记住什么、怎么找回来、语义向量与向量索引怎么接的。与 04 冲突时以 09 为准 |
 
 ## 现状盘点（基于本仓库与 `D:\obsidian\yixiongfei` 的实际内容）
 
