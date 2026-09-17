@@ -12,7 +12,7 @@
   - **专注不打断**：只从 Idle / Break 触发进食，Working / Studying 时不打断，Sleeping 时不叫醒。
   - 摸头/摸身体经 `pet_touched` 命令回传给 Core，数值怎么变由状态机说了算，Body 不自己算。提起不扣心情——docs/01 的原则是情绪只正向放大。
   - 新命令：`get_pet_state`（Body 启动时拉一次，不用干等推送）、`pet_touched`、`debug_patch_pet_state`（改数值验证阈值）。原来的假状态源 `debug_set_pet_state` 随之删除。
-  - **还没有持久化**：进程重启数值归零；`Ill` 要连续 3 天 PoorCondition，同样得等 roadmap 2.1 的 SQLite。
+  - `Ill` 心情暂时产不出来：它要「连续 3 天 PoorCondition」，得先在流水上做跨天统计，留给 Phase 7 的 Mood Engine。
 - **食物精灵**：夹心的中间那层补齐了。`assets-src/food/` 收了原版的 123 项食物（名字、eat/drink/gift、回多少饱腹/水），图转 128px WebP 共 ~520 KB。精灵按原版放进 `宽×宽` 的方盒等比内接、绕中心旋转、带不透明度，轨迹走 `FoodAnimation` 的 `aN` 关键帧。挑食物时排掉 `Drug`——那是原版用来救存档的药，`太阳系` 一口下去体力 −100，自发进食不该吃它。
 - **夹心动画（双图层）**（roadmap 1.1 最后一项）：吃 / 喝 / 收礼是三层——后层宠物本体 → 食物精灵 → 前层手。播放器从「单 clip 单游标」重构成「多轨道共享一个时钟」：前后层帧数不同但总时长相同（Eat/Nomal 是 19 帧 vs 8 帧、都 2625 ms），每层按各自的累计时间表反查帧号，不会互相漂移。
 - **饱腹 / 口渴进入 PetState**：`hunger` / `thirst` 两个维度，`Activity` 加 `eating` / `drinking`。这是自发行为的燃料——宠物有了不依赖用户输入、自己会动起来的理由。数值下降与阈值触发是 Phase 2 的 Rust 状态机的事，Body 只渲染。
