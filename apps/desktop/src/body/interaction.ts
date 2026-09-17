@@ -63,7 +63,8 @@ export class Interaction {
     const changed =
       s.activity !== this.state.activity ||
       s.mood !== this.state.mood ||
-      s.action?.id !== this.state.action?.id
+      s.action?.id !== this.state.action?.id ||
+      s.action?.food?.id !== this.state.action?.food?.id
     this.state = s
     if (changed && this.mode === 'idle') this.toActivity()
   }
@@ -151,7 +152,12 @@ export class Interaction {
     const { type, name } = CLIP_FOR[this.state.activity]
     // Core 指名了具体动作就用它的动画（同是 working，文案≠修屏幕），否则用兜底
     const graph = this.state.action?.graph ?? name
-    void this.o.player.play({ type, name: this.nameFor(type, graph), mood: this.state.mood })
+    void this.o.player.play({
+      type,
+      name: this.nameFor(type, graph),
+      mood: this.state.mood,
+      foodId: this.state.action?.food?.id,
+    })
     this.scheduleIdleAction()
   }
 

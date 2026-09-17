@@ -7,7 +7,7 @@ import { HitMask } from './hitMask'
 import { Interaction } from './interaction'
 import { loadManifest, loadProfile } from './manifest'
 import { fetchPetState, subscribePetState } from './petState'
-import { pushHitMask, reportTouch } from './petWindow'
+import { pushFoodCatalog, pushHitMask, reportTouch } from './petWindow'
 import { cannedReply, hideDelayMs } from './say'
 import { toLogical } from './touch'
 
@@ -50,6 +50,8 @@ export function PetCanvas() {
         const interaction = new Interaction({ player, manifest, profile, onTouch: reportTouch })
         interactionRef.current = interaction
         interaction.start()
+        // Core 要按需求和钱包挑吃的，先把目录给它
+        pushFoodCatalog(manifest.food)
         stops.push(subscribePetState((s) => interaction.setState(s)))
         // Core 只在活动/心情变化时才推，启动时先主动拉一次
         void fetchPetState().then((s) => { if (s && !disposed) interaction.setState(s) })

@@ -3,4 +3,5 @@
 
 pub mod actions;
 pub mod db;
+pub mod food;
 pub mod state_machine;

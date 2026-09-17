@@ -19,6 +19,12 @@ export const setHitTestPinned = (pinned: boolean) => void invokeCore('set_hit_te
 export const reportTouch = (zone: string) => void invokeCore('pet_touched', { zone })
 
 /**
+ * 把食物目录交给 Core。食物数据来自 manifest（build-assets 从原版转出的 123 项），
+ * 但「买哪样」是状态机的决定——它得先看得见这张表。
+ */
+export const pushFoodCatalog = (items: unknown[]) => void invokeCore('set_food_catalog', { items })
+
+/**
  * 按逻辑像素平移宠物窗口——提起时用来让窗口跟住光标。
  * 浏览器预览里没有 Tauri，静默跳过（动画照常，只是窗口不动）。
  */

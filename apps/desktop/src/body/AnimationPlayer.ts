@@ -18,6 +18,8 @@ export interface PlayTarget {
   /** 动画名字；缺省 = type（如 default/default） */
   name?: string
   mood?: Mood
+  /** 夹心动画中间那层用哪样食物。Core 挑好了就指定，没指定才随机 */
+  foodId?: string
 }
 
 /** 'step' = 由外部状态机编排的单段播放，见 playStep */
@@ -43,7 +45,10 @@ export class AnimationPlayer {
   /** 夹心中间那层：食物精灵 + 它自己的时间轴 */
   private food: { item: FoodItem; bmp: ImageBitmap; keys: FoodKeyframe[]; cum: number[] } | null = null
   private readonly foodCache = new Map<string, ImageBitmap>()
-  private target: Required<PlayTarget> | null = null
+  /** Core 指定的食物 id；没指定就随机挑 */
+  private foodId: string | undefined
+  /** foodId 单独放在 this.foodId，不进 target */
+  private target: Required<Omit<PlayTarget, 'foodId'>> | null = null
   private phase: Phase = 'loop'
   /** 绘制顺序：后层 → 前层。tracks[0] 是主轨，它播完就算这一段播完 */
   private tracks: Track[] = []
@@ -87,6 +92,7 @@ export class AnimationPlayer {
     this.stepDone = null
     this.layered = null
     this.food = null
+    this.foodId = t.foodId
 
     // 夹心动画（吃 / 喝 / 收礼）走两层轨道
     const layered = resolveLayered(this.manifest, this.target.type, this.target.name, this.target.mood)
@@ -172,7 +178,8 @@ export class AnimationPlayer {
       console.warn(`[AnimationPlayer] 夹心动画缺层：${l.id}`)
       return this.finish(gen)
     }
-    const item = pickFood(this.manifest, l.name)
+    // Core 挑好了就用它的，否则自己随机（Core 还没拿到目录时会这样）
+    const item = (this.foodId && this.manifest.food.find((f) => f.id === this.foodId)) || pickFood(this.manifest, l.name)
     const [tracks, bmp] = await Promise.all([
       Promise.all([this.loadTrack(back), this.loadTrack(front)]),
       item ? this.loadFoodImage(item) : Promise.resolve(null),

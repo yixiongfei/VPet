@@ -7,11 +7,12 @@
 
 mod core;
 
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use core::actions::Catalog;
 use core::db::Db;
+use core::food::{FoodItem, FoodShelf};
 use core::state_machine::{catch_up, reduce, Event, Pet, PetState, Touch};
 
 use tauri::{
@@ -124,9 +125,11 @@ fn debug_patch_pet_state(
 /// 把事件喂给状态机，落到共享状态，然后广播给 Body
 fn apply(app: &AppHandle, event: &Event) {
     let cat = app.state::<Catalog>();
+    let shelf = app.state::<RwLock<FoodShelf>>();
+    let Ok(shelf) = shelf.read() else { return };
     let pet = app.state::<Mutex<Pet>>();
     let Ok(mut st) = pet.lock() else { return };
-    let mut next = reduce(&cat, &st, event);
+    let mut next = reduce(&cat, &shelf, &st, event);
     next.state.updated_at = now_ms();
     *st = next.clone();
     drop(st);
@@ -159,12 +162,15 @@ fn spawn_pet_clock(app: AppHandle) {
         loop {
             std::thread::sleep(TICK);
             let cat = app.state::<Catalog>();
+            let shelf = app.state::<RwLock<FoodShelf>>();
+            let Ok(shelf) = shelf.read() else { continue };
             let pet = app.state::<Mutex<Pet>>();
             let Ok(mut st) = pet.lock() else { continue };
             let before = st.state.clone();
 
             let mut next = reduce(
                 &cat,
+                &shelf,
                 &st,
                 &Event::Tick {
                     minutes: TICK.as_secs_f32() / 60.0,
@@ -182,9 +188,13 @@ fn spawn_pet_clock(app: AppHandle) {
                 last_sync = Instant::now();
                 if changed {
                     if let Some(a) = next.state.action.as_ref() {
+                        let what = match a.food.as_ref() {
+                            Some(f) => format!("{}（{}）", a.name, f.name),
+                            None => a.name.clone(),
+                        };
                         log::info!(
                             "{} —— {}（体力{:.0} 心情{:.0} 饱腹{:.0} 水{:.0} 钱{:.0} Lv{}）",
-                            a.name, a.reason,
+                            what, a.reason,
                             next.state.strength, next.state.feeling,
                             next.state.hunger, next.state.thirst,
                             next.state.money, next.state.level
@@ -213,7 +223,7 @@ fn persist(app: &AppHandle, p: &Pet) {
 /// 开库、读回上次的状态、把关掉期间的时间补上。
 ///
 /// 数据库打不开就在内存里跑（数值不留存），不该让宠物起不来。
-fn restore_state(app: &AppHandle, cat: &Catalog) -> Pet {
+fn restore_state(app: &AppHandle, cat: &Catalog, shelf: &FoodShelf) -> Pet {
     let path = match app.path().app_data_dir() {
         Ok(dir) => dir.join("vpet.db"),
         Err(e) => {
@@ -230,7 +240,7 @@ fn restore_state(app: &AppHandle, cat: &Catalog) -> Pet {
     };
     let restored = match db.latest_pet_state() {
         Ok(Some(p)) => {
-            let after = catch_up(cat, &p, now_ms(), hour_now());
+            let after = catch_up(cat, shelf, &p, now_ms(), hour_now());
             log::info!(
                 "读回上次状态（距今 {:.0} 分钟）：饱腹 {:.0} → {:.0}",
                 (now_ms() - p.state.updated_at) as f32 / 60_000.0,
@@ -247,6 +257,19 @@ fn restore_state(app: &AppHandle, cat: &Catalog) -> Pet {
     };
     app.manage(Mutex::new(db));
     restored
+}
+
+/// Body 启动时把食物目录交给 Core。
+///
+/// 123 项食物是 build-assets 从原版 `food/*.lps` 转出来的，躺在 Body 的 manifest 里；
+/// Core 要按需求和钱包挑一样买，就得先拿到这张表。和推命中掩码一个路子。
+#[tauri::command]
+fn set_food_catalog(shelf: State<'_, RwLock<FoodShelf>>, items: Vec<FoodItem>) {
+    let n = items.len();
+    if let Ok(mut s) = shelf.write() {
+        s.set(items);
+        log::info!("收到食物目录：{n} 项");
+    }
 }
 
 /// Body 每换一帧推一次当前帧的 alpha 掩码（按位打包的 48×48）
@@ -280,8 +303,11 @@ pub fn run() {
             // 动作表读在最前面：状态机的每一步都要查它
             let cat = Catalog::load();
             // 再把上次的状态读回来（含关掉期间的补算），然后让心跳接手
-            let restored = restore_state(app.handle(), &cat);
+            // 食物目录要等 Body 推过来，这之前货架是空的（买不起就退回动作表自带的量）
+            let shelf = FoodShelf::default();
+            let restored = restore_state(app.handle(), &cat, &shelf);
             app.manage(cat);
+            app.manage(RwLock::new(shelf));
             app.manage(Mutex::new(restored));
             if let Some(win) = app.get_webview_window(PET_WINDOW) {
                 place_bottom_right(&win);
@@ -302,7 +328,8 @@ pub fn run() {
             pet_touched,
             debug_patch_pet_state,
             set_hit_mask,
-            set_hit_test_pinned
+            set_hit_test_pinned,
+            set_food_catalog
         ])
         .build(tauri::generate_context!())
         .expect("VPet 启动失败")

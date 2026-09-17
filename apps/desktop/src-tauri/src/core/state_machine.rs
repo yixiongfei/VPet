@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::actions::{ActionDef, Catalog};
+use super::food::{FoodShelf, Need};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -49,6 +50,14 @@ pub enum Mood {
     Ill,
 }
 
+/// 她买下的那一样东西。Body 照这个 id 渲染精灵，不再自己随便抓一个
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FoodRef {
+    pub id: String,
+    pub name: String,
+}
+
 /// 正在做的事。Body 用 `graph` 挑动画，也能直接显示「正在：文案」
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -58,6 +67,8 @@ pub struct ActionRef {
     pub graph: String,
     /// 为什么选了它。让数值变动有迹可循
     pub reason: String,
+    /// 吃 / 喝 时她买的那样东西
+    pub food: Option<FoodRef>,
 }
 
 /// 发给 Body 的 `pet:state` 载荷，字段与 packages/shared/src/pet.ts 的 zod schema 一一对应
@@ -193,10 +204,10 @@ pub fn earn_multiplier(s: &PetState) -> f32 {
 }
 
 /// 状态机主体。不设置 `updated_at`——那是时钟，由调用方填
-pub fn reduce(cat: &Catalog, p: &Pet, e: &Event) -> Pet {
+pub fn reduce(cat: &Catalog, shelf: &FoodShelf, p: &Pet, e: &Event) -> Pet {
     let mut n = p.clone();
     match e {
-        Event::Tick { minutes, hour } => tick(cat, &mut n, minutes.max(0.0), *hour),
+        Event::Tick { minutes, hour } => tick(cat, shelf, &mut n, minutes.max(0.0), *hour),
         Event::Touched(t) => {
             n.state.feeling += match t {
                 Touch::Head => FEELING_HEAD,
@@ -235,7 +246,7 @@ pub fn reduce(cat: &Catalog, p: &Pet, e: &Event) -> Pet {
     n
 }
 
-fn tick(cat: &Catalog, n: &mut Pet, minutes: f32, hour: f32) {
+fn tick(cat: &Catalog, shelf: &FoodShelf, n: &mut Pet, minutes: f32, hour: f32) {
     // 1. 冷却倒数
     n.cooldowns.retain(|_, left| {
         *left -= minutes;
@@ -250,10 +261,25 @@ fn tick(cat: &Catalog, n: &mut Pet, minutes: f32, hour: f32) {
         .and_then(|a| cat.get(&a.id))
         .unwrap_or_else(|| cat.fallback());
     let d = current.per_min;
+    // 吃喝时以「她买的那样东西」的数值为准；还没拿到食物目录时退回动作表自带的量
+    let (dh, dt, df) = match n.state.action.as_ref().and_then(|a| a.food.as_ref()) {
+        Some(f) => match shelf.get(&f.id) {
+            Some(item) => {
+                let dur = current.duration.max(0.01);
+                (
+                    item.strength_food / dur,
+                    item.strength_drink / dur,
+                    item.feeling / dur,
+                )
+            }
+            None => (d.hunger, d.thirst, d.feeling),
+        },
+        None => (d.hunger, d.thirst, d.feeling),
+    };
     n.state.strength += d.strength * minutes;
-    n.state.hunger += d.hunger * minutes;
-    n.state.thirst += d.thirst * minutes;
-    n.state.feeling += d.feeling * minutes;
+    n.state.hunger += dh * minutes;
+    n.state.thirst += dt * minutes;
+    n.state.feeling += df * minutes;
 
     let mult = earn_multiplier(&n.state);
     let money = current.earns.money * mult * minutes;
@@ -297,7 +323,7 @@ fn tick(cat: &Catalog, n: &mut Pet, minutes: f32, hour: f32) {
     let busy = n.state.activity.is_transient() && !done;
     if !busy && (n.state.action.is_none() || should_switch(cat, n, hour)) {
         let chosen = decide(cat, &n.state, &n.cooldowns, hour);
-        adopt(n, chosen);
+        adopt(shelf, n, chosen);
     }
 }
 
@@ -422,32 +448,62 @@ fn meets(a: &ActionDef, s: &PetState) -> bool {
         && s.strength <= r.max_strength
 }
 
-fn adopt(n: &mut Pet, (a, reason): (&ActionDef, &'static str)) {
+fn adopt(shelf: &FoodShelf, n: &mut Pet, (a, reason): (&ActionDef, &'static str)) {
     let same = n.state.action.as_ref().is_some_and(|c| c.id == a.id);
     if same {
         return;
     }
+    // 吃喝就得先买。挑什么取决于缺什么——心情不好的时候买的东西不一样
+    let food = buy(shelf, a, &mut n.state);
     n.state.activity = a.activity;
     n.state.action = Some(ActionRef {
         id: a.id.clone(),
         name: a.name.clone(),
         graph: a.graph.clone(),
         reason: reason.to_string(),
+        food,
     });
     n.elapsed = 0.0;
     n.earned = 0.0;
 }
 
+/// 挑一样买下来，扣钱。买不起就返回 None——调用方退回动作表自带的量，
+/// 免得钱包空了就把自己饿死（家里总还有点存粮）。
+fn buy(shelf: &FoodShelf, a: &ActionDef, s: &mut PetState) -> Option<FoodRef> {
+    let graph = if a.has_tag("drink") {
+        "drink"
+    } else if a.has_tag("eat") {
+        "eat"
+    } else {
+        return None;
+    };
+    let need = if graph == "drink" {
+        Need::Thirst
+    } else if s.feeling < SAD {
+        Need::Mood // 心情差就买点好的哄自己
+    } else {
+        Need::Hunger
+    };
+    let item = shelf.pick(graph, need, s.money)?;
+    s.money = (s.money - item.price).max(0.0);
+    s.strength = (s.strength + item.strength).clamp(0.0, 100.0);
+    Some(FoodRef {
+        id: item.id.clone(),
+        name: item.name.clone(),
+    })
+}
+
 /// 把「上次记录到现在」这段离线时间一次性补上。
 ///
 /// 这是 `reduce` 保持纯函数换来的直接好处：补两小时和跑两小时走的是同一段代码。
-pub fn catch_up(cat: &Catalog, p: &Pet, now_ms: i64, hour: f32) -> Pet {
+pub fn catch_up(cat: &Catalog, shelf: &FoodShelf, p: &Pet, now_ms: i64, hour: f32) -> Pet {
     let minutes = (now_ms - p.state.updated_at).max(0) as f32 / 60_000.0;
     if minutes < 1.0 {
         return p.clone();
     }
     reduce(
         cat,
+        shelf,
         p,
         &Event::Tick {
             minutes: minutes.min(MAX_CATCHUP_MIN),
@@ -489,11 +545,48 @@ mod tests {
         Catalog::load()
     }
 
+    /// 单元测试默认用空货架：买不起就退回动作表自带的量，
+    /// 这样绝大多数测试不用关心食物，只有专门测购买的才装货
+    fn shelf() -> FoodShelf {
+        FoodShelf::default()
+    }
+
+    fn stocked() -> FoodShelf {
+        use super::super::food::FoodItem;
+        let mk = |id: &str, graph: &str, kind: &str, food: f32, drink: f32, feel: f32, price: f32| FoodItem {
+            id: id.into(),
+            name: id.into(),
+            graph: graph.into(),
+            kind: kind.into(),
+            strength: 0.0,
+            strength_food: food,
+            strength_drink: drink,
+            feeling: feel,
+            health: 0.0,
+            price,
+        };
+        let mut s = FoodShelf::default();
+        s.set(vec![
+            mk("bun", "eat", "Meal", 40.0, 0.0, 1.0, 10.0),
+            mk("cake", "eat", "Snack", 8.0, 0.0, 40.0, 25.0),
+            mk("tea", "drink", "Drink", 0.0, 45.0, 2.0, 6.0),
+        ]);
+        s
+    }
+
     /// 跑 n 分钟，每分钟一拍，钟点跟着走
     fn run(cat: &Catalog, mut p: Pet, minutes: u32, start_hour: f32) -> Pet {
         for i in 0..minutes {
             let hour = (start_hour + i as f32 / 60.0) % 24.0;
-            p = reduce(cat, &p, &Event::Tick { minutes: 1.0, hour });
+            p = reduce(cat, &shelf(), &p, &Event::Tick { minutes: 1.0, hour });
+        }
+        p
+    }
+
+    fn run_with(cat: &Catalog, sh: &FoodShelf, mut p: Pet, minutes: u32, start_hour: f32) -> Pet {
+        for i in 0..minutes {
+            let hour = (start_hour + i as f32 / 60.0) % 24.0;
+            p = reduce(cat, sh, &p, &Event::Tick { minutes: 1.0, hour });
         }
         p
     }
@@ -674,7 +767,7 @@ mod tests {
         let mut p = Pet::default();
         p.state.feeling = 5.0;
         // 上午十点本该上班
-        p = reduce(&c, &p, &Event::Tick { minutes: 1.0, hour: 10.0 });
+        p = reduce(&c, &shelf(), &p, &Event::Tick { minutes: 1.0, hour: 10.0 });
         let a = p.state.action.as_ref().unwrap();
         assert!(
             c.get(&a.id).unwrap().has_tag("cheer"),
@@ -691,7 +784,7 @@ mod tests {
         let mut worst = 100.0f32;
         for i in 0..(10 * 60) {
             let hour = (9.0 + i as f32 / 60.0) % 24.0;
-            p = reduce(&c, &p, &Event::Tick { minutes: 1.0, hour });
+            p = reduce(&c, &shelf(), &p, &Event::Tick { minutes: 1.0, hour });
             worst = worst.min(p.state.feeling);
         }
         assert!(worst > 0.0, "从早九点干到晚七点，心情被磨到了 {worst}");
@@ -724,10 +817,10 @@ mod tests {
         let mut p = Pet::default();
         p.state.hunger = 5.0;
         // 上午十点，本该上班；但饿到不行，先吃
-        p = reduce(&c, &p, &Event::Tick { minutes: 1.0, hour: 10.0 });
+        p = reduce(&c, &shelf(), &p, &Event::Tick { minutes: 1.0, hour: 10.0 });
         assert_eq!(p.state.activity, Activity::Eating);
         // 下一拍还在吃，不能被上班抢走
-        p = reduce(&c, &p, &Event::Tick { minutes: 0.5, hour: 10.0 });
+        p = reduce(&c, &shelf(), &p, &Event::Tick { minutes: 0.5, hour: 10.0 });
         assert_eq!(p.state.activity, Activity::Eating, "过场动画不许打断");
     }
 
@@ -738,7 +831,7 @@ mod tests {
         let first = acting(&p);
         let mut switches = 0;
         for _ in 0..20 {
-            p = reduce(&c, &p, &Event::Tick { minutes: 1.0, hour: 10.0 });
+            p = reduce(&c, &shelf(), &p, &Event::Tick { minutes: 1.0, hour: 10.0 });
             if acting(&p) != first {
                 switches += 1;
             }
@@ -764,7 +857,7 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for i in 0..(24 * 60) {
             let hour = (i as f32 / 60.0) % 24.0;
-            p = reduce(&c, &p, &Event::Tick { minutes: 1.0, hour });
+            p = reduce(&c, &shelf(), &p, &Event::Tick { minutes: 1.0, hour });
             seen.insert(p.state.activity);
         }
         assert!(seen.len() >= 4, "一整天只出现了 {:?}", seen);
@@ -772,11 +865,76 @@ mod tests {
         assert!(seen.contains(&Activity::Eating), "一天都没吃饭");
     }
 
+    /* ---- 她自己挣钱、自己买东西 ---- */
+
+    #[test]
+    fn 吃饭会花钱并且买的东西记在案() {
+        let c = cat();
+        let mut p = Pet::default();
+        p.state.money = 100.0;
+        p.state.hunger = 5.0; // 饿到不行，一定会去吃
+        let p = reduce(&c, &stocked(), &p, &Event::Tick { minutes: 1.0, hour: 12.0 });
+        let a = p.state.action.as_ref().unwrap();
+        let f = a.food.as_ref().expect("吃饭得先买一样东西");
+        assert_eq!(f.id, "bun", "饿的时候该买管饱的");
+        assert!(p.state.money < 100.0, "买了东西却没花钱");
+    }
+
+    #[test]
+    fn 心情差的时候买的东西不一样() {
+        let c = cat();
+        let mut p = Pet::default();
+        p.state.money = 100.0;
+        p.state.hunger = 5.0;
+        p.state.feeling = 5.0; // 又饿又难受
+        let p = reduce(&c, &stocked(), &p, &Event::Tick { minutes: 1.0, hour: 12.0 });
+        let f = p.state.action.as_ref().unwrap().food.as_ref().unwrap();
+        assert_eq!(f.id, "cake", "心情差就该买点好的哄自己，而不是啃馒头");
+    }
+
+    #[test]
+    fn 买的东西真的回饱腹() {
+        let c = cat();
+        let mut p = Pet::default();
+        p.state.money = 100.0;
+        p.state.hunger = 5.0;
+        // 吃饭 duration=2，馒头回 40 → 两分钟吃完该到 45 上下
+        let p = run_with(&c, &stocked(), p, 2, 12.0);
+        assert!(p.state.hunger > 35.0, "实际 {}", p.state.hunger);
+    }
+
+    #[test]
+    fn 没钱也不会把自己饿死() {
+        let c = cat();
+        let mut p = Pet::default();
+        p.state.money = 0.0; // 一分钱没有
+        p.state.hunger = 5.0;
+        let p = run_with(&c, &stocked(), p, 2, 12.0);
+        let a = p.state.action.as_ref().unwrap();
+        assert!(a.food.is_none(), "没钱不该凭空变出食物");
+        assert!(p.state.hunger > 5.0, "买不起也得退回动作表自带的量，不能饿死");
+    }
+
+    #[test]
+    fn 货架空着照样能过日子() {
+        // Body 还没把目录推过来的那段时间
+        let c = cat();
+        let p = run(&c, Pet::default(), 24 * 60, 0.0);
+        assert!(p.state.hunger > 0.0);
+    }
+
+    #[test]
+    fn 挣的钱够她自己吃饭() {
+        let c = cat();
+        let p = run_with(&c, &stocked(), Pet::default(), 24 * 60, 0.0);
+        assert!(p.state.money > 0.0, "忙活一整天最后一分钱不剩，经济尺度不对");
+    }
+
     #[test]
     fn 摸头涨心情() {
         let c = cat();
         let p = Pet::default();
-        let after = reduce(&c, &p, &Event::Touched(Touch::Head));
+        let after = reduce(&c, &shelf(), &p, &Event::Touched(Touch::Head));
         assert!(after.state.feeling > p.state.feeling);
         assert!(after.state.strength < p.state.strength, "摸也要消耗一点体力");
     }
@@ -785,7 +943,7 @@ mod tests {
     fn 提起不扣心情() {
         let c = cat();
         let p = Pet::default();
-        let after = reduce(&c, &p, &Event::Touched(Touch::Raise));
+        let after = reduce(&c, &shelf(), &p, &Event::Touched(Touch::Raise));
         assert!(
             after.state.feeling >= p.state.feeling,
             "情绪引擎只正向放大（docs/01）"
@@ -798,12 +956,12 @@ mod tests {
         let mut p = Pet::default();
         p.state.feeling = 80.0;
         assert_eq!(
-            reduce(&c, &p, &Event::Touched(Touch::Raise)).state.mood,
+            reduce(&c, &shelf(), &p, &Event::Touched(Touch::Raise)).state.mood,
             Mood::Happy
         );
         p.state.feeling = 20.0;
         assert_eq!(
-            reduce(&c, &p, &Event::Touched(Touch::Raise)).state.mood,
+            reduce(&c, &shelf(), &p, &Event::Touched(Touch::Raise)).state.mood,
             Mood::PoorCondition
         );
     }
@@ -814,7 +972,7 @@ mod tests {
         let mut p = Pet::default();
         p.state.feeling = 100.0;
         p.state.strength = POOR_STRENGTH - 1.0;
-        let s = reduce(&c, &p, &Event::Touched(Touch::Raise));
+        let s = reduce(&c, &shelf(), &p, &Event::Touched(Touch::Raise));
         assert_eq!(s.state.mood, Mood::PoorCondition, "体力见底时心情再好也是状态差");
     }
 
@@ -822,7 +980,7 @@ mod tests {
     fn 离线期间照样会饿() {
         let c = cat();
         let p = Pet::default();
-        let after = catch_up(&c, &p, 2 * 60 * 60 * 1000, 10.0);
+        let after = catch_up(&c, &shelf(), &p, 2 * 60 * 60 * 1000, 10.0);
         assert!(after.state.hunger < p.state.hunger, "关掉期间也该掉饱腹");
     }
 
@@ -830,7 +988,7 @@ mod tests {
     fn 离线太久不会把宠物饿死() {
         let c = cat();
         let p = Pet::default();
-        let after = catch_up(&c, &p, 3 * 24 * 60 * 60 * 1000, 10.0);
+        let after = catch_up(&c, &shelf(), &p, 3 * 24 * 60 * 60 * 1000, 10.0);
         assert!(after.state.hunger > 0.0, "离线三天回来不该饿到脱力");
         assert_ne!(
             after.state.mood,
@@ -845,7 +1003,7 @@ mod tests {
         let mut p = Pet::default();
         p.state.updated_at = 1_000;
         p.state.hunger = 50.0;
-        let after = catch_up(&c, &p, 1_500, 10.0);
+        let after = catch_up(&c, &shelf(), &p, 1_500, 10.0);
         assert_eq!(after.state.hunger, 50.0);
     }
 
@@ -858,6 +1016,7 @@ mod tests {
             let hour = (3.0 + i as f32 / 3600.0) % 24.0;
             by_sec = reduce(
                 &c,
+                &shelf(),
                 &by_sec,
                 &Event::Tick {
                     minutes: 1.0 / 60.0,
@@ -887,6 +1046,10 @@ mod tests {
 mod 一天的生活 {
     use super::*;
 
+    fn shelf() -> FoodShelf {
+        FoodShelf::default()
+    }
+
     #[test]
     #[ignore = "不是断言，是拿来看她一天怎么过的"]
     fn 打印作息表() {
@@ -895,7 +1058,7 @@ mod 一天的生活 {
         let mut last = String::new();
         for i in 0..(24 * 60) {
             let hour = i as f32 / 60.0;
-            p = reduce(&c, &p, &Event::Tick { minutes: 1.0, hour });
+            p = reduce(&c, &shelf(), &p, &Event::Tick { minutes: 1.0, hour });
             let now = p.state.action.as_ref().map(|a| a.id.clone()).unwrap_or_default();
             if now != last {
                 let a = p.state.action.as_ref().unwrap();

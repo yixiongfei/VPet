@@ -17,6 +17,8 @@ export const ActionRef = z.object({
   name: z.string(),
   graph: z.string(),
   reason: z.string(),
+  /** 吃 / 喝 时她买下的那一样东西，Body 照这个 id 渲染精灵 */
+  food: z.object({ id: z.string(), name: z.string() }).nullish(),
 })
 export type ActionRef = z.infer<typeof ActionRef>
 
