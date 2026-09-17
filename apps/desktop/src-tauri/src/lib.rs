@@ -10,8 +10,9 @@ mod core;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use core::actions::Catalog;
 use core::db::Db;
-use core::state_machine::{catch_up, reduce, Activity, Event, PetState, Touch};
+use core::state_machine::{catch_up, reduce, Event, Pet, PetState, Touch};
 
 use tauri::{
     menu::{CheckMenuItem, Menu, MenuItem},
@@ -35,8 +36,6 @@ const POLL: Duration = Duration::from_millis(50);
 /// 状态推进的节拍。一秒一次，数值按 1/60 分钟走——比每分钟一跳平滑，
 /// 也让吃喝这种几秒钟的过场能踩准点
 const TICK: Duration = Duration::from_secs(1);
-/// 吃 / 喝 演多久。和夹心动画的长度（约 2.6 s）对齐
-const CONSUME: Duration = Duration::from_millis(2600);
 /// 活动和心情都没变时，最多隔这么久也要把数值同步给 Body 一次
 const SYNC_EVERY: Duration = Duration::from_secs(30);
 /// 状态落库的间隔。一分钟一条，掉电最多丢一分钟的数值
@@ -81,8 +80,8 @@ fn app_version() -> &'static str {
 
 /// Body 启动时拉一次当前状态，不用干等下一次 `pet:state`
 #[tauri::command]
-fn get_pet_state(pet: State<'_, Mutex<PetState>>) -> PetState {
-    pet.lock().map(|s| *s).unwrap_or_default()
+fn get_pet_state(pet: State<'_, Mutex<Pet>>) -> PetState {
+    pet.lock().map(|p| p.state.clone()).unwrap_or_default()
 }
 
 /// Body 报告宠物被摸了。数值怎么变是状态机的事，Body 不算数
@@ -108,6 +107,7 @@ fn debug_patch_pet_state(
     feeling: Option<f32>,
     hunger: Option<f32>,
     thirst: Option<f32>,
+    money: Option<f32>,
 ) {
     apply(
         &app,
@@ -116,19 +116,29 @@ fn debug_patch_pet_state(
             feeling,
             hunger,
             thirst,
+            money,
         },
     );
 }
 
 /// 把事件喂给状态机，落到共享状态，然后广播给 Body
 fn apply(app: &AppHandle, event: &Event) {
-    let pet = app.state::<Mutex<PetState>>();
+    let cat = app.state::<Catalog>();
+    let pet = app.state::<Mutex<Pet>>();
     let Ok(mut st) = pet.lock() else { return };
-    let mut next = reduce(&st, event);
-    next.updated_at = now_ms();
-    *st = next;
+    let mut next = reduce(&cat, &st, event);
+    next.state.updated_at = now_ms();
+    *st = next.clone();
     drop(st);
-    let _ = app.emit("pet:state", next);
+    let _ = app.emit("pet:state", next.state);
+}
+
+/// 当前钟点（本地时区，0–24 的小数）。作息判断要的就是「现在几点」，
+/// 状态机不读时钟，由这里喂进去
+fn hour_now() -> f32 {
+    use chrono::Timelike;
+    let t = chrono::Local::now();
+    t.hour() as f32 + t.minute() as f32 / 60.0
 }
 
 fn now_ms() -> i64 {
@@ -145,47 +155,43 @@ fn spawn_pet_clock(app: AppHandle) {
     std::thread::spawn(move || {
         let mut last_sync = Instant::now();
         let mut last_persist = Instant::now();
-        // 吃 / 喝 演了多久。放在这里而不是 PetState 里，是为了让 reduce 保持纯函数
-        let mut consuming_since: Option<Instant> = None;
 
         loop {
             std::thread::sleep(TICK);
-            let pet = app.state::<Mutex<PetState>>();
+            let cat = app.state::<Catalog>();
+            let pet = app.state::<Mutex<Pet>>();
             let Ok(mut st) = pet.lock() else { continue };
-            let before = *st;
+            let before = st.state.clone();
 
             let mut next = reduce(
-                &before,
+                &cat,
+                &st,
                 &Event::Tick {
                     minutes: TICK.as_secs_f32() / 60.0,
+                    hour: hour_now(),
                 },
             );
-
-            // 吃 / 喝 是过场：演够 CONSUME 就把饱腹/水补上并回空闲
-            if matches!(next.activity, Activity::Eating | Activity::Drinking) {
-                let since = consuming_since.get_or_insert_with(Instant::now);
-                if since.elapsed() >= CONSUME {
-                    next = reduce(&next, &Event::Consumed);
-                    consuming_since = None;
-                }
-            } else {
-                consuming_since = None;
-            }
-
-            next.updated_at = now_ms();
-            *st = next;
+            next.state.updated_at = now_ms();
+            *st = next.clone();
             drop(st);
 
-            let changed = next.activity != before.activity || next.mood != before.mood;
+            let acted = next.state.action.as_ref().map(|a| a.id.as_str());
+            let acted_before = before.action.as_ref().map(|a| a.id.as_str());
+            let changed = acted != acted_before || next.state.mood != before.mood;
             if changed || last_sync.elapsed() >= SYNC_EVERY {
                 last_sync = Instant::now();
                 if changed {
-                    log::info!(
-                        "状态：{:?}/{:?} 体力{:.0} 心情{:.0} 饱腹{:.0} 水{:.0}",
-                        next.activity, next.mood, next.strength, next.feeling, next.hunger, next.thirst
-                    );
+                    if let Some(a) = next.state.action.as_ref() {
+                        log::info!(
+                            "{} —— {}（体力{:.0} 心情{:.0} 饱腹{:.0} 水{:.0} 钱{:.0} Lv{}）",
+                            a.name, a.reason,
+                            next.state.strength, next.state.feeling,
+                            next.state.hunger, next.state.thirst,
+                            next.state.money, next.state.level
+                        );
+                    }
                 }
-                let _ = app.emit("pet:state", next);
+                let _ = app.emit("pet:state", next.state.clone());
             }
             if last_persist.elapsed() >= PERSIST_EVERY {
                 last_persist = Instant::now();
@@ -196,10 +202,10 @@ fn spawn_pet_clock(app: AppHandle) {
 }
 
 /// 落一条状态流水。存不进去不该影响宠物继续跑——大不了这次的数值丢了
-fn persist(app: &AppHandle, s: &PetState) {
+fn persist(app: &AppHandle, p: &Pet) {
     let Some(db) = app.try_state::<Mutex<Db>>() else { return };
     let Ok(db) = db.lock() else { return };
-    if let Err(e) = db.record_pet_state(s) {
+    if let Err(e) = db.record_pet_state(p) {
         log::warn!("状态落库失败: {e}");
     }
 }
@@ -207,36 +213,36 @@ fn persist(app: &AppHandle, s: &PetState) {
 /// 开库、读回上次的状态、把关掉期间的时间补上。
 ///
 /// 数据库打不开就在内存里跑（数值不留存），不该让宠物起不来。
-fn restore_state(app: &AppHandle) -> PetState {
+fn restore_state(app: &AppHandle, cat: &Catalog) -> Pet {
     let path = match app.path().app_data_dir() {
         Ok(dir) => dir.join("vpet.db"),
         Err(e) => {
             log::warn!("拿不到数据目录，这次不落库: {e}");
-            return PetState::default();
+            return Pet::default();
         }
     };
     let db = match Db::open(&path) {
         Ok(db) => db,
         Err(e) => {
             log::warn!("数据库打不开，这次不落库: {e}");
-            return PetState::default();
+            return Pet::default();
         }
     };
     let restored = match db.latest_pet_state() {
-        Ok(Some(s)) => {
-            let after = catch_up(&s, now_ms());
+        Ok(Some(p)) => {
+            let after = catch_up(cat, &p, now_ms(), hour_now());
             log::info!(
                 "读回上次状态（距今 {:.0} 分钟）：饱腹 {:.0} → {:.0}",
-                (now_ms() - s.updated_at) as f32 / 60_000.0,
-                s.hunger,
-                after.hunger
+                (now_ms() - p.state.updated_at) as f32 / 60_000.0,
+                p.state.hunger,
+                after.state.hunger
             );
             after
         }
-        Ok(None) => PetState::default(),
+        Ok(None) => Pet::default(),
         Err(e) => {
             log::warn!("读上次状态失败，按新宠物开始: {e}");
-            PetState::default()
+            Pet::default()
         }
     };
     app.manage(Mutex::new(db));
@@ -271,8 +277,11 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(Mutex::new(HitState::default()))
         .setup(|app| {
-            // 先把上次的状态读回来（含关掉期间的补算），再让心跳接手
-            let restored = restore_state(app.handle());
+            // 动作表读在最前面：状态机的每一步都要查它
+            let cat = Catalog::load();
+            // 再把上次的状态读回来（含关掉期间的补算），然后让心跳接手
+            let restored = restore_state(app.handle(), &cat);
+            app.manage(cat);
             app.manage(Mutex::new(restored));
             if let Some(win) = app.get_webview_window(PET_WINDOW) {
                 place_bottom_right(&win);
@@ -300,11 +309,11 @@ pub fn run() {
         .run(|app, event| {
             // 退出前再存一次，免得白丢最后这一分钟的数值
             if matches!(event, tauri::RunEvent::Exit) {
-                if let Some(pet) = app.try_state::<Mutex<PetState>>() {
-                    let snapshot = pet.lock().map(|s| *s).ok();
-                    if let Some(mut s) = snapshot {
-                        s.updated_at = now_ms();
-                        persist(app, &s);
+                if let Some(pet) = app.try_state::<Mutex<Pet>>() {
+                    let snapshot = pet.lock().map(|p| p.clone()).ok();
+                    if let Some(mut p) = snapshot {
+                        p.state.updated_at = now_ms();
+                        persist(app, &p);
                     }
                 }
             }

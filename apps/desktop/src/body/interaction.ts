@@ -60,7 +60,10 @@ export class Interaction {
    */
   setState(s: PetState): void {
     if (this.disposed) return
-    const changed = s.activity !== this.state.activity || s.mood !== this.state.mood
+    const changed =
+      s.activity !== this.state.activity ||
+      s.mood !== this.state.mood ||
+      s.action?.id !== this.state.action?.id
     this.state = s
     if (changed && this.mode === 'idle') this.toActivity()
   }
@@ -146,7 +149,9 @@ export class Interaction {
     this.mode = 'idle'
     this.setPinned(false)
     const { type, name } = CLIP_FOR[this.state.activity]
-    void this.o.player.play({ type, name: this.nameFor(type, name), mood: this.state.mood })
+    // Core 指名了具体动作就用它的动画（同是 working，文案≠修屏幕），否则用兜底
+    const graph = this.state.action?.graph ?? name
+    void this.o.player.play({ type, name: this.nameFor(type, graph), mood: this.state.mood })
     this.scheduleIdleAction()
   }
 

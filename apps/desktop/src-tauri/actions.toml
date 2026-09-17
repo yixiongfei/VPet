@@ -1,0 +1,274 @@
+# 动作表：她能做的每件事，以及做这件事对身上数值的影响。
+#
+# 这张表就是给人调的。想让运动更提神？把那条的 per_min.feeling 调大，不用改一行代码。
+#
+# 字段含义
+#   per_min   每分钟的数值变化。**正数 = 涨，负数 = 掉**，一眼能看出这件事消耗什么、给什么
+#   earns     每分钟的产出。money / exp 还要再乘一个效率系数——吃饱喝足才有高效率，
+#             公式见 state_machine.rs 的 efficiency()
+#   requires  前置条件。不满足就不会被选中
+#   duration  一次做多久（分钟）。0 = 不限时，作为兜底一直做
+#   cooldown  做完之后多少分钟内不再选它，避免一直重复同一件事
+#   finish    做完时一次性额外给的倍率（× 这一轮已赚到的量）
+#   hours     适合在一天中的哪些时段做，如 [[9,12],[14,18]]。留空 = 任何时候都行。
+#             跨夜写成 [[23,7]]。这是「像人一样生活」的关键：到点吃饭、到点睡觉，
+#             而不是等某个数值掉到阈值才动
+#   tags      给决策用的标签，见 state_machine.rs 的 decide()
+#
+# 数值移植自原版 vup.lps 的 work 表（assets-src/pet/vup.lps），但**饱腹/口渴的消耗
+# 按 1/10 缩过**：原版那组数是「每个交互周期」的量，不是每分钟。照搬的话 文案
+# （Time=60）一场要吃掉 210 点饱腹，实际表现是她每六分钟就得往嘴里塞一次东西。
+# MoneyBase 同样缩 1/10，否则一天能赚两千多，而一份食物才十几块，经济尺度对不上。
+# cooldown / tags / hours / requires.min_* 是原版没有的，我们加的。
+
+# ---------- 兜底：没别的事可做时 ----------
+
+[[action]]
+id = "rest"
+name = "发呆"
+activity = "idle"
+graph = "default"
+tags = ["rest"]
+duration = 0
+cooldown = 0
+per_min = { strength = 0.5, hunger = -0.4, thirst = -0.3, feeling = 0.0 }
+
+[[action]]
+id = "sleep"
+name = "睡觉"
+activity = "sleeping"
+graph = "sleep"
+tags = ["rest", "recover", "sleep"]
+duration = 420          # 一觉七小时
+cooldown = 600
+hours = [[23, 7]]       # 夜里该睡了。白天累趴了也会睡——那走的是「生理急需」那条路
+per_min = { strength = 1.0, hunger = -0.12, thirst = -0.15, feeling = 0.1 }
+
+[[action]]
+id = "nap"
+name = "午睡"
+activity = "sleeping"
+graph = "sleep"
+tags = ["rest", "recover", "sleep"]
+duration = 40
+cooldown = 300
+hours = [[13, 14]]
+per_min = { strength = 0.8, hunger = -0.2, thirst = -0.3, feeling = 0.2 }
+requires = { max_strength = 70 }   # 不困就不午睡
+
+# ---------- 吃喝：到饭点就吃，不是等饿到阈值 ----------
+# 数值是「每分钟」，所以一顿 duration=2 分钟 → 回 50 饱腹
+
+[[action]]
+id = "meal"
+name = "吃饭"
+activity = "eating"
+graph = "eat"
+tags = ["eat", "need"]
+duration = 2
+cooldown = 150
+hours = [[7, 9], [11, 13], [17, 19]]   # 一日三餐
+per_min = { strength = 0.5, hunger = 25.0, thirst = -0.1, feeling = 1.0 }
+
+[[action]]
+id = "snack"
+name = "加餐"
+activity = "eating"
+graph = "eat"
+tags = ["eat", "need"]
+duration = 1
+cooldown = 60
+per_min = { strength = 0.2, hunger = 20.0, thirst = -0.1, feeling = 0.5 }
+
+[[action]]
+id = "drink"
+name = "喝水"
+activity = "drinking"
+graph = "drink"
+tags = ["drink", "need"]
+duration = 1
+cooldown = 40
+per_min = { strength = 0.2, hunger = -0.2, thirst = 35.0, feeling = 0.3 }
+
+# ---------- 工作：赚钱，掉心情 ----------
+
+[[action]]
+id = "work_copy"
+name = "文案"
+activity = "working"
+graph = "workone"
+tags = ["work", "earn"]
+duration = 60
+cooldown = 30
+hours = [[9, 12], [14, 18]]
+per_min = { strength = -0.3, hunger = -0.35, thirst = -0.25, feeling = -0.5 }
+earns = { money = 0.8 }
+finish = 0.1
+requires = { min_strength = 20, min_hunger = 15, min_thirst = 15 }
+
+[[action]]
+id = "work_bbq"
+name = "烧烤"
+activity = "working"
+graph = "grilledsausage"
+tags = ["work", "earn"]
+duration = 30
+cooldown = 40
+hours = [[9, 12], [14, 18]]
+per_min = { strength = -0.3, hunger = 0.0, thirst = -0.5, feeling = -0.25 }
+earns = { money = 1.2 }
+finish = 0.15
+requires = { level = 5, min_strength = 20, min_thirst = 20 }
+
+[[action]]
+id = "work_clean"
+name = "清屏"
+activity = "working"
+graph = "workclean"
+tags = ["work", "earn"]
+duration = 90
+cooldown = 60
+hours = [[9, 12], [14, 18]]
+per_min = { strength = -0.3, hunger = -0.5, thirst = -0.5, feeling = -0.875 }
+earns = { money = 1.6 }
+finish = 0.2
+requires = { level = 10, min_strength = 30, min_hunger = 25, min_thirst = 25 }
+
+[[action]]
+id = "work_stream"
+name = "直播"
+activity = "working"
+graph = "worktwo"
+tags = ["work", "earn"]
+duration = 180
+cooldown = 120
+hours = [[14, 18], [20, 23]]
+per_min = { strength = -0.3, hunger = -0.5, thirst = -1.0, feeling = -1.25 }
+earns = { money = 2.8 }
+finish = 0.25
+requires = { level = 20, min_strength = 40, min_hunger = 30, min_thirst = 35 }
+
+[[action]]
+id = "work_fix"
+name = "修屏幕"
+activity = "working"
+graph = "fixmenu"
+tags = ["work", "earn"]
+duration = 120
+cooldown = 120
+hours = [[9, 12], [14, 18]]
+per_min = { strength = -0.3, hunger = -1.0, thirst = -0.8, feeling = -0.625 }
+earns = { money = 3.2 }
+finish = 0.25
+requires = { level = 30, min_strength = 45, min_hunger = 40, min_thirst = 35 }
+
+# ---------- 学习：涨经验，掉心情。等级上去了才能干更赚钱的活 ----------
+
+[[action]]
+id = "study_basic"
+name = "学习"
+activity = "studying"
+graph = "study"
+tags = ["study", "grow"]
+duration = 45
+cooldown = 60
+hours = [[9, 12], [19, 22]]
+per_min = { strength = -0.3, hunger = -0.2, thirst = -0.2, feeling = -1.0 }
+earns = { exp = 80.0 }
+finish = 0.2
+requires = { min_strength = 25, min_hunger = 20, min_thirst = 20 }
+
+[[action]]
+id = "study_calligraphy"
+name = "学书法"
+activity = "studying"
+graph = "calligraphy"
+tags = ["study", "grow"]
+duration = 20
+cooldown = 90
+hours = [[19, 22]]
+# 原版这条漏了 MoneyBase（等于白学），按时长和难度补了一个
+per_min = { strength = -0.2, hunger = -0.1, thirst = -0.1, feeling = -0.5 }
+earns = { exp = 40.0 }
+finish = 0.2
+requires = { level = 8, min_strength = 20 }
+
+[[action]]
+id = "study_research"
+name = "研究"
+activity = "studying"
+graph = "studytwo"
+tags = ["study", "grow"]
+duration = 75
+cooldown = 120
+hours = [[9, 12], [19, 22]]
+per_min = { strength = -0.3, hunger = -0.25, thirst = -0.35, feeling = -1.25 }
+earns = { exp = 120.0 }
+finish = 0.4
+requires = { level = 15, min_strength = 35, min_hunger = 25, min_thirst = 25 }
+
+[[action]]
+id = "study_paint"
+name = "学画画"
+activity = "studying"
+graph = "studypaint"
+tags = ["study", "grow"]
+duration = 120
+cooldown = 180
+hours = [[19, 22]]
+# 同样是原版漏了 MoneyBase
+per_min = { strength = -0.25, hunger = -0.22, thirst = -0.12, feeling = -0.45 }
+earns = { exp = 60.0 }
+finish = 0.25
+requires = { level = 25, min_strength = 40 }
+
+# ---------- 玩：回心情，掉体力 ----------
+
+[[action]]
+id = "play_game"
+name = "玩游戏"
+activity = "playing"
+graph = "playone"
+tags = ["play", "cheer"]
+duration = 30
+cooldown = 45
+hours = [[12, 14], [19, 23]]
+per_min = { strength = -0.2, hunger = -0.1, thirst = -0.15, feeling = 1.0 }
+requires = { min_strength = 15 }
+
+[[action]]
+id = "play_debug"
+name = "删错误"
+activity = "playing"
+graph = "removeobject"
+tags = ["play", "cheer"]
+duration = 60
+cooldown = 60
+hours = [[19, 23]]
+per_min = { strength = -0.2, hunger = -0.05, thirst = -0.05, feeling = 0.5 }
+requires = { level = 6, min_strength = 20 }
+
+[[action]]
+id = "play_rope"
+name = "跳绳"
+activity = "playing"
+graph = "ropeskipping"
+tags = ["play", "exercise"]
+duration = 10
+cooldown = 120
+hours = [[7, 9], [17, 19]]
+# 原版把跳绳算成「累」（Feeling 是正的 0.5 → 心情下降）。想让运动提神就把这个数改成正的
+per_min = { strength = -0.5, hunger = -0.1, thirst = -0.1, feeling = -0.5 }
+requires = { level = 12, min_strength = 30 }
+
+[[action]]
+id = "play_water"
+name = "玩水"
+activity = "playing"
+graph = "playwater"
+tags = ["play", "cheer"]
+duration = 20
+cooldown = 90
+hours = [[12, 14], [19, 23]]
+per_min = { strength = -0.2, hunger = -0.05, thirst = 0.0, feeling = 1.0 }
+requires = { level = 18, min_strength = 20 }

@@ -11,6 +11,15 @@ export const Activity = z.enum([
 ])
 export type Activity = z.infer<typeof Activity>
 
+/** 正在做的事。`graph` 决定播哪段动画，`reason` 说明她为什么选了它 */
+export const ActionRef = z.object({
+  id: z.string(),
+  name: z.string(),
+  graph: z.string(),
+  reason: z.string(),
+})
+export type ActionRef = z.infer<typeof ActionRef>
+
 /** Core → Body 的 `pet:state` 事件载荷 */
 export const PetState = z.object({
   activity: Activity,
@@ -21,6 +30,13 @@ export const PetState = z.object({
   hunger: z.number().min(0).max(100),
   /** 口渴度：低了自己去喝水 */
   thirst: z.number().min(0).max(100),
+  /** 工作挣的钱，用来买东西（Core 的动作表决定挣多少） */
+  money: z.number().min(0),
+  /** 学习涨的经验，决定等级 */
+  exp: z.number().min(0),
+  /** 等级解锁更赚钱的活，也直接给收入加成 */
+  level: z.number().int().min(0),
+  action: ActionRef.nullish(),
   updatedAt: z.number().int(),
 })
 export type PetState = z.infer<typeof PetState>

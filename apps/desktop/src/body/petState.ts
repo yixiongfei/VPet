@@ -10,12 +10,19 @@ export const DEFAULT_PET_STATE: PetState = {
   feeling: 60,
   hunger: 100,
   thirst: 100,
+  money: 0,
+  exp: 0,
+  level: 0,
+  action: null,
   updatedAt: 0,
 }
 
 /**
  * 活动 → 该活动待机时循环播放的动画（docs/05 §3）。
- * 不写 name 的表示「该类型下按心情随机挑一个」，如 idle 的 default、break 的各种 idel。
+ *
+ * 这只是兜底：Core 的动作表会在 `state.action.graph` 里指明具体播哪段
+ * （同是 working，文案 是 workone、修屏幕 是 fixmenu），那个优先。
+ * 不写 name 的表示「该类型下按心情随机挑一个」。
  */
 export const CLIP_FOR: Record<Activity, { type: GraphType; name?: string }> = {
   idle: { type: 'default' },

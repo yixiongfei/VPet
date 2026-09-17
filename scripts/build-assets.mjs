@@ -264,8 +264,8 @@ async function addClipFromFiles(dir, files, startup, line, out, isFile) {
  *
  * `assets-src/food/*.lps` 是原版的食物定义（名字 / 类型 / 用哪段动画 / 营养），
  * 图片按名字对应 `assets-src/food/image/<名字>.png`。
- * 只留 Body 和 Phase 2 的状态机用得到的字段——价格、经验、好感度是原版的养成经济，
- * 这个产品里没有。
+ * 留下 Body 和状态机用得到的字段，含价格与经验——她自己工作挣钱、自己按心情买东西，
+ * 所以经济这部分是要的。只丢掉好感度（那属于原版的养成线）。
  */
 async function buildFood() {
   const lpsFiles = await fs.readdir(FOOD_DIR).catch(() => [])
@@ -285,6 +285,9 @@ async function buildFood() {
         strengthDrink: num(line.subs.StrengthDrink),
         feeling: num(line.subs.Feeling),
         health: num(line.subs.Health),
+        // 她自己挣钱自己买，所以价格是要的（一开始误判成「养成经济，不带过来」）
+        price: num(line.subs.price),
+        exp: num(line.subs.Exp),
         _src: path.join(FOOD_DIR, 'image', `${name}.png`),
       })
     }

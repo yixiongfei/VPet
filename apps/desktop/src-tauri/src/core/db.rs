@@ -7,7 +7,7 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension};
 
-use super::state_machine::PetState;
+use super::state_machine::Pet;
 
 /// 只能往后追加，**永远不要改已有的条目**——老库已经按旧内容跑过了
 const MIGRATIONS: &[&str] = &[
@@ -71,14 +71,16 @@ impl Db {
         Ok(())
     }
 
-    /// 记一条状态流水。状态整体存 JSON——字段以后会加，不想每加一个就来一次迁移
-    pub fn record_pet_state(&self, s: &PetState) -> rusqlite::Result<()> {
-        let json = serde_json::to_string(s).map_err(|e| {
+    /// 记一条状态流水。存的是整个 `Pet`（含冷却和当前进度），这样重启之后
+    /// 「刚吃过所以一会儿不吃」这类信息也还在。整体存 JSON——字段以后会加，
+    /// 不想每加一个就来一次迁移
+    pub fn record_pet_state(&self, p: &Pet) -> rusqlite::Result<()> {
+        let json = serde_json::to_string(p).map_err(|e| {
             rusqlite::Error::ToSqlConversionFailure(Box::new(e))
         })?;
         self.conn.execute(
             "INSERT INTO pet_state_log (recorded_at, state) VALUES (?1, ?2)",
-            (s.updated_at, json),
+            (p.state.updated_at, json),
         )?;
         self.conn.execute(
             "DELETE FROM pet_state_log WHERE id <= (
@@ -90,7 +92,7 @@ impl Db {
     }
 
     /// 最近一条状态。没有（第一次启动）或者存的内容读不回来时返回 None
-    pub fn latest_pet_state(&self) -> rusqlite::Result<Option<PetState>> {
+    pub fn latest_pet_state(&self) -> rusqlite::Result<Option<Pet>> {
         let json: Option<String> = self
             .conn
             .query_row(
@@ -113,7 +115,7 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::state_machine::{Activity, Mood};
+    use crate::core::state_machine::{Activity, Mood, PetState};
 
     #[test]
     fn 迁移可以重复跑() {
@@ -136,31 +138,40 @@ mod tests {
     #[test]
     fn 存了能原样读回来() {
         let db = Db::open_in_memory().unwrap();
-        let s = PetState {
-            activity: Activity::Sleeping,
-            mood: Mood::Happy,
-            strength: 42.5,
-            feeling: 77.0,
-            hunger: 33.0,
-            thirst: 11.0,
-            updated_at: 1_700_000_000_000,
+        let p = Pet {
+            state: PetState {
+                activity: Activity::Sleeping,
+                mood: Mood::Happy,
+                strength: 42.5,
+                feeling: 77.0,
+                hunger: 33.0,
+                thirst: 11.0,
+                money: 120.0,
+                exp: 900.0,
+                level: 3,
+                action: None,
+                updated_at: 1_700_000_000_000,
+            },
+            elapsed: 12.0,
+            earned: 5.0,
+            cooldowns: [("work_copy".to_string(), 20.0)].into_iter().collect(),
         };
-        db.record_pet_state(&s).unwrap();
-        assert_eq!(db.latest_pet_state().unwrap().unwrap(), s);
+        db.record_pet_state(&p).unwrap();
+        let back = db.latest_pet_state().unwrap().unwrap();
+        assert_eq!(back.state, p.state);
+        assert_eq!(back.cooldowns, p.cooldowns, "冷却也要跟着重启活下来");
     }
 
     #[test]
     fn 读到的是最新那条() {
         let db = Db::open_in_memory().unwrap();
         for hunger in [90.0, 80.0, 70.0] {
-            db.record_pet_state(&PetState {
-                hunger,
-                updated_at: hunger as i64,
-                ..Default::default()
-            })
-            .unwrap();
+            let mut p = Pet::default();
+            p.state.hunger = hunger;
+            p.state.updated_at = hunger as i64;
+            db.record_pet_state(&p).unwrap();
         }
-        assert_eq!(db.latest_pet_state().unwrap().unwrap().hunger, 70.0);
+        assert_eq!(db.latest_pet_state().unwrap().unwrap().state.hunger, 70.0);
     }
 
     #[test]
@@ -179,11 +190,9 @@ mod tests {
     fn 流水不会无限涨() {
         let db = Db::open_in_memory().unwrap();
         for i in 0..(MAX_LOG_ROWS + 200) {
-            db.record_pet_state(&PetState {
-                updated_at: i,
-                ..Default::default()
-            })
-            .unwrap();
+            let mut p = Pet::default();
+            p.state.updated_at = i;
+            db.record_pet_state(&p).unwrap();
         }
         let n: i64 = db
             .conn
