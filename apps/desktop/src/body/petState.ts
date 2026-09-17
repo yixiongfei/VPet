@@ -1,5 +1,6 @@
 import { PetState, type Activity, type GraphType } from '@vpet/shared'
 import { subscribe } from './events'
+import { invokeCore } from './ipc'
 
 /** Core 还没发过状态时的兜底；Phase 2 起由 Rust 的状态机接管 */
 export const DEFAULT_PET_STATE: PetState = {
@@ -35,4 +36,17 @@ export function subscribePetState(onState: (s: PetState) => void): () => void {
     if (parsed.success) onState(parsed.data)
     else console.warn('[VPet] pet:state 载荷不合法', parsed.error.issues)
   })
+}
+
+/**
+ * 启动时拉一次当前状态。Core 只在活动/心情变化时才推送，
+ * 不主动拉的话可能要干等几十秒才知道宠物现在在干嘛。
+ */
+export async function fetchPetState(): Promise<PetState | null> {
+  const raw = await invokeCore<unknown>('get_pet_state')
+  if (raw === null) return null
+  const parsed = PetState.safeParse(raw)
+  if (parsed.success) return parsed.data
+  console.warn('[VPet] get_pet_state 载荷不合法', parsed.error.issues)
+  return null
 }

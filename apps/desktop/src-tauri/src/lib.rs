@@ -1,11 +1,15 @@
 //! VPet Core（Rust 侧）。
 //!
-//! Phase 0 只做三件事：把 pet 窗口放到屏幕右下角、托盘菜单（显示/隐藏、退出）、一个 `app_version` 命令
-//! 用来验证 IPC。状态机 / 调度 / 工具 / 权限 / 存储从 Phase 2 起在 `core/` `tools/` `memory/` 下展开
-//! （见 docs/03-architecture.md §3）。
+//! 目前这里负责：宠物窗口的摆位与托盘、鼠标穿透的 alpha 命中判定、全局快捷键，
+//! 以及 `core/state_machine.rs` 的状态机和驱动它的心跳——数值随时间走、饿了自己去吃。
+//! 调度 / 工具 / 权限 / 存储还没做，见 docs/03-architecture.md §3 与 docs/07 Phase 2。
+
+mod core;
 
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use core::state_machine::{reduce, Activity, Event, PetState, Touch};
 
 use tauri::{
     menu::{CheckMenuItem, Menu, MenuItem},
@@ -25,6 +29,14 @@ const MASK_N: usize = 48;
 const PET_LOGICAL_SIZE: f64 = 500.0;
 /// 光标轮询间隔（docs/05 §4）
 const POLL: Duration = Duration::from_millis(50);
+
+/// 状态推进的节拍。一秒一次，数值按 1/60 分钟走——比每分钟一跳平滑，
+/// 也让吃喝这种几秒钟的过场能踩准点
+const TICK: Duration = Duration::from_secs(1);
+/// 吃 / 喝 演多久。和夹心动画的长度（约 2.6 s）对齐
+const CONSUME: Duration = Duration::from_millis(2600);
+/// 活动和心情都没变时，最多隔这么久也要把数值同步给 Body 一次
+const SYNC_EVERY: Duration = Duration::from_secs(30);
 
 /// 鼠标穿透的判定状态。
 ///
@@ -63,12 +75,115 @@ fn app_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// Phase 1 的假状态源：把调用方给的载荷原样当 `pet:state` 发给 Body，用来调
-/// 「活动/心情 → 动画」的映射。Phase 2 起改由 `core/state_machine.rs` 的真状态机发，
-/// 这个命令随之删掉。载荷形状由前端的 zod `PetState` 把关（docs/03 §5 事件面）。
+/// Body 启动时拉一次当前状态，不用干等下一次 `pet:state`
 #[tauri::command]
-fn debug_set_pet_state(app: AppHandle, state: serde_json::Value) -> Result<(), String> {
-    app.emit("pet:state", state).map_err(|e| e.to_string())
+fn get_pet_state(pet: State<'_, Mutex<PetState>>) -> PetState {
+    pet.lock().map(|s| *s).unwrap_or_default()
+}
+
+/// Body 报告宠物被摸了。数值怎么变是状态机的事，Body 不算数
+#[tauri::command]
+fn pet_touched(app: AppHandle, zone: String) {
+    let touch = match zone.as_str() {
+        "head" => Touch::Head,
+        "body" => Touch::Body,
+        "raise" => Touch::Raise,
+        other => {
+            log::warn!("未知的触摸区域 {other}");
+            return;
+        }
+    };
+    apply(&app, &Event::Touched(touch));
+}
+
+/// 调试：直接改数值，用来验证阈值行为（把 hunger 调低看它去不去吃）
+#[tauri::command]
+fn debug_patch_pet_state(
+    app: AppHandle,
+    strength: Option<f32>,
+    feeling: Option<f32>,
+    hunger: Option<f32>,
+    thirst: Option<f32>,
+) {
+    apply(
+        &app,
+        &Event::Patch {
+            strength,
+            feeling,
+            hunger,
+            thirst,
+        },
+    );
+}
+
+/// 把事件喂给状态机，落到共享状态，然后广播给 Body
+fn apply(app: &AppHandle, event: &Event) {
+    let pet = app.state::<Mutex<PetState>>();
+    let Ok(mut st) = pet.lock() else { return };
+    let mut next = reduce(&st, event);
+    next.updated_at = now_ms();
+    *st = next;
+    drop(st);
+    let _ = app.emit("pet:state", next);
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// 宠物的心跳：推进数值、到点触发吃喝、变化时同步给 Body。
+///
+/// 这是「有身体」的关键——不需要用户说话，它自己就会饿、会去吃、会累。
+fn spawn_pet_clock(app: AppHandle) {
+    std::thread::spawn(move || {
+        let mut last_sync = Instant::now();
+        // 吃 / 喝 演了多久。放在这里而不是 PetState 里，是为了让 reduce 保持纯函数
+        let mut consuming_since: Option<Instant> = None;
+
+        loop {
+            std::thread::sleep(TICK);
+            let pet = app.state::<Mutex<PetState>>();
+            let Ok(mut st) = pet.lock() else { continue };
+            let before = *st;
+
+            let mut next = reduce(
+                &before,
+                &Event::Tick {
+                    minutes: TICK.as_secs_f32() / 60.0,
+                },
+            );
+
+            // 吃 / 喝 是过场：演够 CONSUME 就把饱腹/水补上并回空闲
+            if matches!(next.activity, Activity::Eating | Activity::Drinking) {
+                let since = consuming_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= CONSUME {
+                    next = reduce(&next, &Event::Consumed);
+                    consuming_since = None;
+                }
+            } else {
+                consuming_since = None;
+            }
+
+            next.updated_at = now_ms();
+            *st = next;
+            drop(st);
+
+            let changed = next.activity != before.activity || next.mood != before.mood;
+            if changed || last_sync.elapsed() >= SYNC_EVERY {
+                last_sync = Instant::now();
+                if changed {
+                    log::info!(
+                        "状态：{:?}/{:?} 体力{:.0} 心情{:.0} 饱腹{:.0} 水{:.0}",
+                        next.activity, next.mood, next.strength, next.feeling, next.hunger, next.thirst
+                    );
+                }
+                let _ = app.emit("pet:state", next);
+            }
+        }
+    });
 }
 
 /// Body 每换一帧推一次当前帧的 alpha 掩码（按位打包的 48×48）
@@ -98,12 +213,14 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(Mutex::new(HitState::default()))
+        .manage(Mutex::new(PetState::default()))
         .setup(|app| {
             if let Some(win) = app.get_webview_window(PET_WINDOW) {
                 place_bottom_right(&win);
             }
             build_tray(app.handle())?;
             spawn_hit_test(app.handle().clone());
+            spawn_pet_clock(app.handle().clone());
             if let Err(e) = register_prompt_shortcut(app.handle()) {
                 // 快捷键被别的程序占了不该拖垮启动，双击宠物一样能呼出输入框
                 log::warn!("注册全局快捷键 {PROMPT_SHORTCUT} 失败: {e}");
@@ -113,7 +230,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             app_version,
-            debug_set_pet_state,
+            get_pet_state,
+            pet_touched,
+            debug_patch_pet_state,
             set_hit_mask,
             set_hit_test_pinned
         ])

@@ -6,8 +6,8 @@ import { subscribe } from './events'
 import { HitMask } from './hitMask'
 import { Interaction } from './interaction'
 import { loadManifest, loadProfile } from './manifest'
-import { subscribePetState } from './petState'
-import { pushHitMask } from './petWindow'
+import { fetchPetState, subscribePetState } from './petState'
+import { pushHitMask, reportTouch } from './petWindow'
 import { cannedReply, hideDelayMs } from './say'
 import { toLogical } from './touch'
 
@@ -46,10 +46,13 @@ export function PetCanvas() {
           const changed = mask.update(composited)
           if (changed) void pushHitMask(changed)
         }
-        const interaction = new Interaction({ player, manifest, profile })
+        // 摸到了就报给 Core，数值怎么变由状态机决定（docs/03 §7）
+        const interaction = new Interaction({ player, manifest, profile, onTouch: reportTouch })
         interactionRef.current = interaction
         interaction.start()
         stops.push(subscribePetState((s) => interaction.setState(s)))
+        // Core 只在活动/心情变化时才推，启动时先主动拉一次
+        void fetchPetState().then((s) => { if (s && !disposed) interaction.setState(s) })
         // Rust 侧全局快捷键按下时发这个事件（见 src-tauri/src/lib.rs）
         stops.push(subscribe('pet:prompt', () => setInputOpen(true)))
         console.info(
