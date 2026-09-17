@@ -35,6 +35,41 @@ export const GraphClip = z.object({
 })
 export type GraphClip = z.infer<typeof GraphClip>
 
+/**
+ * 食物精灵的一段轨迹。`visible: false` 表示这段时间食物不画
+ * （原版 `a8#750` 只给时长就是这个意思）。坐标同样在 500×500 逻辑参考系里。
+ */
+export const FoodKeyframe = z.object({
+  ms: z.number().positive(),
+  visible: z.boolean(),
+  x: z.number().optional(),
+  y: z.number().optional(),
+  width: z.number().optional(),
+  rotate: z.number().optional(),
+  opacity: z.number().optional(),
+})
+export type FoodKeyframe = z.infer<typeof FoodKeyframe>
+
+/**
+ * 夹心动画：后层（宠物本体）→ 食物精灵 → 前层（手）。
+ * 移植自 legacy/VPet-Simulator.Core/Graph/FoodAnimation.cs——那里的注释写得很直白：
+ * 「第二层夹心为运行时提供」。前后两层帧数不同但总时长相同，共用一个时钟。
+ */
+export const LayeredClip = z.object({
+  id: z.string(),
+  type: GraphType,
+  name: z.string(),
+  mood: Mood,
+  animat: Animat,
+  /** 后层 clip id（宠物本体） */
+  back: z.string(),
+  /** 前层 clip id（手，盖在食物上面） */
+  front: z.string(),
+  food: z.array(FoodKeyframe),
+  source: z.string(),
+})
+export type LayeredClip = z.infer<typeof LayeredClip>
+
 export const Manifest = z.object({
   pet: z.string(),
   size: z.number().int(),
@@ -42,6 +77,8 @@ export const Manifest = z.object({
   clips: z.array(GraphClip),
   /** "type/name/mood/animat" → clip ids（同键多个 = 随机变体） */
   index: z.record(z.string(), z.array(z.string())),
+  /** 夹心动画。数量很少（吃/喝/收礼 × 心情），查找直接线性找 */
+  layered: z.array(LayeredClip).default([]),
 })
 export type Manifest = z.infer<typeof Manifest>
 

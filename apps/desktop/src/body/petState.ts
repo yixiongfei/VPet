@@ -7,6 +7,8 @@ export const DEFAULT_PET_STATE: PetState = {
   mood: 'nomal',
   strength: 100,
   feeling: 60,
+  hunger: 100,
+  thirst: 100,
   updatedAt: 0,
 }
 
@@ -21,6 +23,9 @@ export const CLIP_FOR: Record<Activity, { type: GraphType; name?: string }> = {
   break: { type: 'idel' },
   sleeping: { type: 'sleep' },
   playing: { type: 'work', name: 'playone' },
+  // 夹心动画：AnimationPlayer 认出来后会拉起后层 + 前层两条轨道
+  eating: { type: 'common', name: 'eat' },
+  drinking: { type: 'common', name: 'drink' },
 }
 
 /** 订阅 Core 的 `pet:state`，载荷过一遍 zod，不合法只 warn 不崩 */

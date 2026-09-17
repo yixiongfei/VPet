@@ -31,10 +31,13 @@ export class HitMask {
     this.ctx = ctx
   }
 
-  /** 用这一帧重算掩码；掩码没变化时返回 null，避免白推一次 IPC */
-  update(bmp: ImageBitmap): Uint8Array | null {
+  /**
+   * 用画布上已合成好的这一帧重算掩码；掩码没变化时返回 null，避免白推一次 IPC。
+   * 取合成结果而不是单张图，夹心动画（后层 + 前层）的轮廓才是对的。
+   */
+  update(src: CanvasImageSource): Uint8Array | null {
     this.ctx.clearRect(0, 0, N, N)
-    this.ctx.drawImage(bmp, 0, 0, N, N)
+    this.ctx.drawImage(src, 0, 0, N, N)
     const { data } = this.ctx.getImageData(0, 0, N, N)
 
     this.packed.fill(0)

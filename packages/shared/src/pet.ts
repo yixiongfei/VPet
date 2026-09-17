@@ -4,7 +4,11 @@ import { z } from 'zod'
 export const Mood = z.enum(['happy', 'nomal', 'poorcondition', 'ill'])
 export type Mood = z.infer<typeof Mood>
 
-export const Activity = z.enum(['idle', 'working', 'break', 'studying', 'sleeping', 'playing'])
+export const Activity = z.enum([
+  'idle', 'working', 'break', 'studying', 'sleeping', 'playing',
+  /** 饱腹/口渴掉到阈值以下时由 Core 触发，播夹心动画（后层宠物 → 食物 → 前层手） */
+  'eating', 'drinking',
+])
 export type Activity = z.infer<typeof Activity>
 
 /** Core → Body 的 `pet:state` 事件载荷 */
@@ -13,6 +17,10 @@ export const PetState = z.object({
   mood: Mood,
   strength: z.number().min(0).max(100),
   feeling: z.number().min(0).max(100),
+  /** 饱腹度：低了自己去吃东西 */
+  hunger: z.number().min(0).max(100),
+  /** 口渴度：低了自己去喝水 */
+  thirst: z.number().min(0).max(100),
   updatedAt: z.number().int(),
 })
 export type PetState = z.infer<typeof PetState>

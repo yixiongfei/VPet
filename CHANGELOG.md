@@ -3,6 +3,8 @@
 ## 未发布 · Phase 1「Body MVP」进行中
 
 ### 新增
+- **夹心动画（双图层）**（roadmap 1.1 最后一项）：吃 / 喝 / 收礼是三层——后层宠物本体 → 食物精灵 → 前层手。播放器从「单 clip 单游标」重构成「多轨道共享一个时钟」：前后层帧数不同但总时长相同（Eat/Nomal 是 19 帧 vs 8 帧、都 2625 ms），每层按各自的累计时间表反查帧号，不会互相漂移。
+- **饱腹 / 口渴进入 PetState**：`hunger` / `thirst` 两个维度，`Activity` 加 `eating` / `drinking`。这是自发行为的燃料——宠物有了不依赖用户输入、自己会动起来的理由。数值下降与阈值触发是 Phase 2 的 Rust 状态机的事，Body 只渲染。
 - **鼠标穿透 / alpha 命中**（roadmap 1.2）：Body 每帧把画面缩到 48×48 读回 alpha、按位打包成 288 字节推给 Core（掩码没变就不推）；Core 每 50 ms 读一次光标，压在不透明像素上才关掉穿透，且只在结果变化时才动窗口。判定不用 touchhead/touchbody 矩形——它们只盖住头和身体，而 touchraised 是整幅 500 宽的带子，当命中区太粗。
   - **失败安全**：掩码未到 / 光标读不到 / 锁被污染，一律退到「不穿透」。穿透错了宠物就再也点不着，不穿透错了只是挡住下面一次点击。
   - 交互期间由 Body 钉住不穿透，否则拖拽会被轮询切断。
@@ -15,6 +17,8 @@
 - `AnimationPlayer.playStep()`：只播一个段落并回调，供外部状态机逐段编排（提起就是这么拼的）。
 
 ### 修复
+- **`build-assets` 漏掉了一半的图层标记**：`layer` 靠名字后缀判断，而 `info.lps` 声明的名字带变体后缀（`eat_back_lay_2`），正则匹配不上。带 `layer` 的 clip 从 16 段修到 22 段。
+- **`build-assets` 整个吞掉了 `FoodAnimation`**：这类条目没有 `path#` 子项，于是被当成「扫描本目录的 PNG」——而那个目录下只有子目录，什么也扫不到，食物轨迹 `a0..aN` 全丢了。现在单独处理，解析出 10 段夹心动画。
 - **提起会被 Tauri 的 ACL 拦下**：`capabilities/default.json` 只授了 `allow-start-dragging`，而提起改用 `setPosition` 跟随光标。补 `core:window:allow-set-position`，移掉不再用的 `allow-start-dragging`。
 - `docs/05` §4 写的「气泡位置由 pet.json 的 `say` 锚点决定」不成立——`vup.lps` 里没有这个键。按原版 `MessageBar` 的底对齐规则修正。
 

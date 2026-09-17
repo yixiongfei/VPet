@@ -64,7 +64,12 @@ interface Manifest { pet: 'vup'; size: 500; clips: GraphClip[]; index: Record<st
 - 帧解码：`createImageBitmap(await fetch(assetUrl).then(r => r.blob()))`，每个 clip 首次播放前预解码全部帧；LRU 缓存最多 ~40 个 clip（500×500×4B×~13 帧 ≈ 13 MB/clip → 上限 ~500 MB 显存，需要实测调低）。
 - **三段式播放**：`play(type, name, mood)` → `start`（若有）→ `loop`（循环，直到 `stop()`）→ `end`（若有）→ 回到 `default`。与原版 `Main.Display(...)` 语义一致。
 - **心情降级**：请求 `happy` 没有时按 `happy → nomal → poorcondition → ill` 顺序找最近的（原版 `FindGraphs` 也这么做）。
-- **双图层**：`back` → `main` → `front` 顺序绘制，同一时钟。
+- **双图层（夹心）**：吃 / 喝 / 收礼是三层——`back`（宠物本体）→ 食物精灵 → `front`（手）。
+  原版 `FoodAnimation.cs` 的注释写得很直白：「第二层夹心为运行时提供」。
+  `info.lps` 里 `FoodAnimation#eat:|a0#175,205,23,60,0,0.375:|…` 的 `aN` 就是食物精灵的轨迹：
+  `时长,x,y,宽,旋转,不透明度`，只给一个值表示这段时间不显示。
+  **前后两层帧数不同但总时长相同**（如 Eat/Nomal：后层 19 帧、前层 8 帧，都是 2625 ms），
+  所以播放器用「一个时钟 + 每层各自的累计时间表反查帧号」，而不是每层一个游标——后者会漂移。
 - **Body 不决定播什么**。它订阅 `pet:state`，用一张纯数据的映射表：
 
 ```ts
@@ -103,14 +108,20 @@ const CLIP_FOR: Record<Activity, { type: GraphType; name?: string }> = {
 
 ## 5. 身体数值（简化版）
 
-保留原版两个维度，去掉饱腹/口渴/金钱（可选开关）：
+保留原版的体力/心情，**也保留饱腹/口渴**（只去掉金钱）：
 
 ```
 strength（体力，0–100）：专注时每分钟 −0.3；休息/空闲每分钟 +0.5；睡眠 +1.0
 feeling （心情，0–100）：完成番茄钟 +5；完成任务 +8；被摸头 +1（每小时上限）；
                          长时间（>3h）无任何互动 −2/h（只到 40，不再往下——不做惩罚）
-mood 由两者决定：feeling ≥ 70 → Happy；≥ 40 → Nomal；< 40 或 strength < 20 → PoorCondition；Ill 仅当连续 3 天 PoorCondition
+hunger  （饱腹，0–100）：随时间下降；低于阈值 → activity 切到 eating，播夹心动画，播完回补
+thirst  （口渴，0–100）：同上 → drinking
+mood 由体力/心情决定：feeling ≥ 70 → Happy；≥ 40 → Nomal；< 40 或 strength < 20 → PoorCondition；Ill 仅当连续 3 天 PoorCondition
 ```
+
+饱腹/口渴是**自发行为的燃料**：它给了宠物一个不依赖用户输入、自己会动起来的理由，
+这正是「有身体」区别于「聊天框」的地方。数值下降与阈值触发都是确定性代码，放 Rust
+`core/state_machine.rs`（Phase 2）；Body 只负责把 `activity` 渲染出来。
 
 数值公式放 Rust `core/state_machine.rs`，可被 `set_setting` 工具调整。原版公式在 `legacy/VPet-Simulator.Core/Display/MainLogic.cs`，只作参考。
 

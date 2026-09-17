@@ -1,5 +1,17 @@
-import type { Animat, GraphClip, GraphType, Manifest, Mood } from '@vpet/shared'
-import { PET_BASE, pick, resolveClips } from './manifest'
+import type { Animat, GraphClip, GraphType, LayeredClip, Manifest, Mood } from '@vpet/shared'
+import { PET_BASE, byId, pick, resolveClips, resolveLayered } from './manifest'
+
+/**
+ * 一条图层轨道。多层共用一个时钟（`elapsed`）：前后层帧数不同但总时长相同，
+ * 各自按累计时间表映射到自己的帧，所以不会互相漂移。
+ */
+interface Track {
+  clip: GraphClip
+  frames: ImageBitmap[]
+  /** 每帧的累计结束时间，用来由时间反查帧号 */
+  cum: number[]
+  idx: number
+}
 
 export interface PlayTarget {
   type: GraphType
@@ -27,11 +39,12 @@ export class AnimationPlayer {
   private cachedBytes = 0
 
   private stepDone: (() => void) | null = null
+  private layered: LayeredClip | null = null
   private target: Required<PlayTarget> | null = null
   private phase: Phase = 'loop'
-  private clip: GraphClip | null = null
-  private frames: ImageBitmap[] = []
-  private frameIdx = 0
+  /** 绘制顺序：后层 → 前层。tracks[0] 是主轨，它播完就算这一段播完 */
+  private tracks: Track[] = []
+  private playing = false
   private elapsed = 0
   private lastT = 0
   private stopping = false
@@ -42,8 +55,10 @@ export class AnimationPlayer {
   /** loop 段自然结束、且已被 stop() 后回调（end 段播完） */
   onIdle: (() => void) | null = null
 
-  /** 每画一帧回调一次，用来更新穿透判定的 alpha 掩码 */
-  onFrame: ((bmp: ImageBitmap) => void) | null = null
+  /** 每画完一帧（所有图层合成后）回调一次，用来更新穿透判定的 alpha 掩码 */
+  onFrame: ((canvas: HTMLCanvasElement) => void) | null = null
+
+  private readonly canvas: HTMLCanvasElement
 
   constructor(
     canvas: HTMLCanvasElement,
@@ -52,6 +67,7 @@ export class AnimationPlayer {
     const ctx = canvas.getContext('2d', { alpha: true })
     if (!ctx) throw new Error('无法创建 2D 上下文')
     this.ctx = ctx
+    this.canvas = canvas
     const dpr = window.devicePixelRatio || 1
     canvas.width = manifest.size * dpr
     canvas.height = manifest.size * dpr
@@ -66,6 +82,11 @@ export class AnimationPlayer {
     this.target = { type: t.type, name: t.name ?? t.type, mood: t.mood ?? 'nomal' }
     this.stopping = false
     this.stepDone = null
+    this.layered = null
+
+    // 夹心动画（吃 / 喝 / 收礼）走两层轨道
+    const layered = resolveLayered(this.manifest, this.target.type, this.target.name, this.target.mood)
+    if (layered) return this.switchToLayered(layered, 'loop', gen)
 
     const start = this.resolve('start')
     const loop = this.resolve('loop')
@@ -132,12 +153,29 @@ export class AnimationPlayer {
   }
 
   private async switchTo(clip: GraphClip, phase: Phase, gen: number): Promise<void> {
-    const frames = await this.decode(clip)
+    const track = await this.loadTrack(clip)
     if (gen !== this.generation || this.destroyed) return
-    this.clip = clip
+    this.begin([track], phase)
+  }
+
+  /** 夹心动画：后层 → 前层两条轨道同时跑（中间的食物精灵在 drawFood 里） */
+  private async switchToLayered(l: LayeredClip, phase: Phase, gen: number): Promise<void> {
+    const back = byId(this.manifest, l.back)
+    const front = byId(this.manifest, l.front)
+    if (!back || !front) {
+      console.warn(`[AnimationPlayer] 夹心动画缺层：${l.id}`)
+      return this.finish(gen)
+    }
+    const tracks = await Promise.all([this.loadTrack(back), this.loadTrack(front)])
+    if (gen !== this.generation || this.destroyed) return
+    this.layered = l
+    this.begin(tracks, phase)
+  }
+
+  private begin(tracks: Track[], phase: Phase): void {
+    this.tracks = tracks
     this.phase = phase
-    this.frames = frames
-    this.frameIdx = 0
+    this.playing = true
     this.elapsed = 0
     this.lastT = performance.now()
     this.draw()
@@ -145,21 +183,33 @@ export class AnimationPlayer {
     this.raf = requestAnimationFrame(this.tick)
   }
 
+  private async loadTrack(clip: GraphClip): Promise<Track> {
+    const frames = await this.decode(clip)
+    let acc = 0
+    const cum = clip.frames.map((f) => (acc += f.ms))
+    return { clip, frames, cum, idx: 0 }
+  }
+
   private tick = (now: number): void => {
-    if (this.destroyed || !this.clip) return
+    if (this.destroyed || !this.playing) return
     const dt = Math.min(now - this.lastT, 250) // 窗口被隐藏后恢复时不要一次跳太多帧
     this.lastT = now
     this.elapsed += dt
 
+    // 主轨（tracks[0]）跑完就算这一段结束；夹心动画前后层总时长相同
+    const total = this.tracks[0]?.cum.at(-1) ?? 0
+    if (this.elapsed >= total) {
+      this.playing = false
+      void this.onClipEnd()
+      return
+    }
+
     let advanced = false
-    while (this.clip && this.elapsed >= this.clip.frames[this.frameIdx].ms) {
-      this.elapsed -= this.clip.frames[this.frameIdx].ms
-      this.frameIdx++
-      advanced = true
-      if (this.frameIdx >= this.clip.frames.length) {
-        this.frameIdx = 0
-        void this.onClipEnd()
-        return
+    for (const t of this.tracks) {
+      // elapsed 单调递增，所以从当前帧往后找就够了；末尾停在最后一帧
+      while (t.idx < t.cum.length - 1 && this.elapsed >= t.cum[t.idx]) {
+        t.idx++
+        advanced = true
       }
     }
     if (advanced) this.draw()
@@ -171,7 +221,6 @@ export class AnimationPlayer {
     if (this.phase === 'step') {
       const done = this.stepDone
       this.stepDone = null
-      this.clip = null
       if (gen === this.generation) done?.()
       return
     }
@@ -184,33 +233,35 @@ export class AnimationPlayer {
     }
     if (this.phase === 'loop') {
       if (!this.stopping) {
+        // 夹心动画只有一份，直接重播
+        if (this.layered) return this.switchToLayered(this.layered, 'loop', gen)
         // 每一轮随机换一个变体（原版 Default 的行为）
         const loop = this.resolve('loop')
         const single = this.resolve('single')
         const next = loop.length ? loop : single
-        return this.switchTo(next.length ? pick(next) : this.clip!, 'loop', gen)
+        return this.switchTo(next.length ? pick(next) : this.tracks[0].clip, 'loop', gen)
       }
       return this.finish(gen)
     }
     // end 段播完
-    this.clip = null
     if (gen === this.generation) this.onIdle?.()
   }
 
   private async finish(gen: number): Promise<void> {
     const end = this.resolve('end')
     if (end.length) return this.switchTo(pick(end), 'end', gen)
-    this.clip = null
     if (gen === this.generation) this.onIdle?.()
   }
 
+  /** 后层 → 前层依次画上去（夹心的食物精灵层在两者之间，见 docs/05 §4） */
   private draw(): void {
-    const bmp = this.frames[this.frameIdx]
-    if (!bmp) return
     const s = this.manifest.size
     this.ctx.clearRect(0, 0, s, s)
-    this.ctx.drawImage(bmp, 0, 0, s, s)
-    this.onFrame?.(bmp)
+    for (const t of this.tracks) {
+      const bmp = t.frames[t.idx]
+      if (bmp) this.ctx.drawImage(bmp, 0, 0, s, s)
+    }
+    this.onFrame?.(this.canvas)
   }
 
   private async decode(clip: GraphClip): Promise<ImageBitmap[]> {
@@ -237,7 +288,7 @@ export class AnimationPlayer {
     // 刚放进来的和正在播的都是最近使用的，不会排在队首，所以 break 只是兜底
     while (this.cachedBytes > MAX_CACHED_BYTES && this.cache.size > 1) {
       const [oldestId, oldest] = this.cache.entries().next().value as [string, ImageBitmap[]]
-      if (oldestId === this.clip?.id || oldestId === clip.id) break
+      if (this.tracks.some((t) => t.clip.id === oldestId) || oldestId === clip.id) break
       oldest.forEach((b) => b.close())
       this.cache.delete(oldestId)
       this.cachedBytes -= this.bytesOf(oldest.length)

@@ -1,6 +1,6 @@
 import {
   Manifest, MOOD_FALLBACK, clipKey, parsePetProfile,
-  type Animat, type GraphClip, type GraphType, type Mood, type PetProfile,
+  type Animat, type GraphClip, type GraphType, type LayeredClip, type Mood, type PetProfile,
 } from '@vpet/shared'
 
 export const PET_BASE = '/pet'
@@ -31,8 +31,20 @@ export function resolveClips(m: Manifest, type: GraphType, name: string, mood: M
   return []
 }
 
+/**
+ * 找 (type, name, mood) 对应的夹心动画（吃 / 喝 / 收礼），同样按 MOOD_FALLBACK 降级。
+ * 夹心动画总共十来段，直接线性找，不值得建索引。
+ */
+export function resolveLayered(m: Manifest, type: GraphType, name: string, mood: Mood): LayeredClip | undefined {
+  for (const fb of MOOD_FALLBACK[mood]) {
+    const hit = m.layered.find((l) => l.type === type && l.name === name && l.mood === fb)
+    if (hit) return hit
+  }
+  return undefined
+}
+
 const idCache = new WeakMap<Manifest, Map<string, GraphClip>>()
-function byId(m: Manifest, id: string): GraphClip | undefined {
+export function byId(m: Manifest, id: string): GraphClip | undefined {
   let map = idCache.get(m)
   if (!map) {
     map = new Map(m.clips.map((c) => [c.id, c]))

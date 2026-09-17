@@ -42,8 +42,8 @@ export function PetCanvas() {
         player = new AnimationPlayer(canvas, manifest)
         // 每帧重算 alpha 掩码推给 Rust 的穿透判定（掩码没变就不推）
         const mask = new HitMask()
-        player.onFrame = (bmp) => {
-          const changed = mask.update(bmp)
+        player.onFrame = (composited) => {
+          const changed = mask.update(composited)
           if (changed) void pushHitMask(changed)
         }
         const interaction = new Interaction({ player, manifest, profile })

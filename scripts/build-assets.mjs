@@ -53,11 +53,13 @@ async function main() {
   // 1. 扫描：目录 → 原始 clip 列表
   const raw = []
   await loadGraphDir(PET_DIR, PET_DIR, raw)
-  console.log(`扫描完成：${raw.length} 段动画，${raw.reduce((n, c) => n + c.files.length, 0)} 帧`)
+  const frameCount = raw.reduce((n, c) => n + (c.files?.length ?? 0), 0)
+  console.log(`扫描完成：${raw.filter((c) => !c._layered).length} 段动画，${frameCount} 帧，${raw.filter((c) => c._layered).length} 段夹心`)
 
   // 2. 分组成变体，生成 clip id
+  const layeredRaw = raw.filter((c) => c._layered)
   const groups = new Map()
-  for (const c of raw.sort((a, b) => a.source.localeCompare(b.source))) {
+  for (const c of raw.filter((c) => !c._layered).sort((a, b) => a.source.localeCompare(b.source))) {
     const key = `${c.type}/${c.name}/${c.mood}/${c.animat}`
     if (!groups.has(key)) groups.set(key, [])
     groups.get(key).push(c)
@@ -139,6 +141,24 @@ async function main() {
     }
   }
 
+  // 3.5 夹心动画：把 info.lps 里写的层名解析成 clip id
+  const layered = []
+  for (const l of layeredRaw.sort((a, b) => a.source.localeCompare(b.source))) {
+    const pick = (name) => index[`${l.type}/${name}/${l.mood}/${l.animat}`]?.[0]
+    const back = pick(l.backName)
+    const front = pick(l.frontName)
+    if (!back || !front) {
+      console.warn(`  [warn] 夹心动画 ${l.name}/${l.mood} 找不到层：back=${l.backName} front=${l.frontName}`)
+      continue
+    }
+    layered.push({
+      id: `${l.type}/${l.name}/${l.mood}/${l.animat}`,
+      type: l.type, name: l.name, mood: l.mood, animat: l.animat,
+      back, front, food: l.food,
+      source: l.source.replaceAll('\\', '/'),
+    })
+  }
+
   // 4. pet.json（vup.lps）
   const petJson = await fs
     .readFile(PET_LPS, 'utf8')
@@ -152,6 +172,7 @@ async function main() {
     generatedAt: new Date().toISOString(),
     clips: clips.map(({ _files, ...c }) => c),
     index,
+    layered,
   }
   if (!DRY) {
     await fs.writeFile(path.join(OUT_DIR, 'manifest.json'), JSON.stringify(manifest))
@@ -163,7 +184,7 @@ async function main() {
   for (const c of clips) byType[c.type] = (byType[c.type] ?? 0) + 1
   console.log('\n按类型统计：')
   for (const [t, n] of Object.entries(byType).sort((a, b) => b[1] - a[1])) console.log(`  ${t.padEnd(22)} ${n}`)
-  console.log(`\nmanifest：${clips.length} clips · ${Object.keys(index).length} 键 · 用时 ${((Date.now() - t0) / 1000).toFixed(1)}s`)
+  console.log(`\nmanifest：${clips.length} clips · ${Object.keys(index).length} 键 · ${layered.length} 段夹心 · 用时 ${((Date.now() - t0) / 1000).toFixed(1)}s`)
   if (!DRY) console.log(`输出：${OUT_DIR}`)
 }
 
@@ -179,6 +200,19 @@ async function loadGraphDir(dir, startup, out) {
     const lines = parseLps(await fs.readFile(infoPath, 'utf8'))
     for (const line of lines) {
       if (!GRAPH_LOADERS.has(line.name.toLowerCase())) continue
+      // 夹心动画：本身没有帧，只声明「后层 + 中间食物轨迹 + 前层」
+      if (line.name.toLowerCase() === 'foodanimation') {
+        out.push({
+          ...graphInfo(dir, true, line, startup),
+          _layered: true,
+          dir,
+          backName: (line.subs.back_lay ?? '').toLowerCase(),
+          frontName: (line.subs.front_lay ?? '').toLowerCase(),
+          food: parseFoodKeyframes(line.subs),
+          source: path.relative(startup, dir),
+        })
+        continue
+      }
       const rel = line.subs.path
       const p = rel ? path.join(dir, rel.replaceAll('\\', path.sep)) : dir
       const st = await fs.stat(p).catch(() => null)
@@ -216,6 +250,27 @@ async function addClipFromFiles(dir, files, startup, line, out, isFile) {
     source: path.relative(startup, dir),
     files: files.map((p) => ({ path: p, ms: frameMs(p) })),
   })
+}
+
+/**
+ * 食物精灵的运动轨迹：`aN#时长,x,y,宽,旋转,不透明度`
+ * （移植自 legacy FoodAnimation.Animation(ISub) 的构造）。
+ * 只给一个值表示这段时间食物不显示，如 `a8#750`。
+ */
+function parseFoodKeyframes(subs) {
+  const out = []
+  for (let i = 0; subs[`a${i}`] !== undefined; i++) {
+    const n = subs[`a${i}`].split(',').map((s) => Number.parseFloat(s))
+    if (n.length === 1) out.push({ ms: n[0], visible: false })
+    else {
+      out.push({
+        ms: n[0], visible: true, x: n[1], y: n[2], width: n[3],
+        rotate: n.length > 4 ? n[4] : 0,
+        opacity: n.length > 5 ? n[5] : 1,
+      })
+    }
+  }
+  return out
 }
 
 /** 帧时长：文件名最后一个 `_` 之后的数字（PNGAnimation.cs:227）；单图默认 1000ms */
@@ -272,7 +327,8 @@ function graphInfo(fsPath, isDir, line, startup) {
   }
   if (!name) name = type
 
-  const layer = name.endsWith('back_lay') ? 'back' : name.endsWith('front_lay') ? 'front' : undefined
+  // 带变体后缀的也算，如 eat_back_lay_2（info.lps 里就是这么命名的）
+  const layer = /back_lay(_\d+)?$/.test(name) ? 'back' : /front_lay(_\d+)?$/.test(name) ? 'front' : undefined
   return { type, name, mood, animat, layer }
 }
 
