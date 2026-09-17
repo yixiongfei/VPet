@@ -23,6 +23,7 @@ use tauri::{
 use tauri_plugin_global_shortcut::Shortcut;
 
 const PET_WINDOW: &str = "pet";
+const PANEL_WINDOW: &str = "panel";
 
 /// 呼出输入框的全局快捷键（docs/05 §4 的默认值，Q 待确认）
 const PROMPT_SHORTCUT: &str = "Alt+V";
@@ -259,6 +260,26 @@ fn restore_state(app: &AppHandle, cat: &Catalog, shelf: &FoodShelf) -> Pet {
     restored
 }
 
+/// 打开面板窗口。已经开着就叫到前台，不重复开
+fn open_panel(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window(PANEL_WINDOW) {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+        return;
+    }
+    let url = tauri::WebviewUrl::App("panel.html".into());
+    match tauri::WebviewWindowBuilder::new(app, PANEL_WINDOW, url)
+        .title("VPet 面板")
+        .inner_size(760.0, 640.0)
+        .min_inner_size(420.0, 420.0)
+        .build()
+    {
+        Ok(_) => log::info!("面板已打开"),
+        Err(e) => log::warn!("打开面板失败: {e}"),
+    }
+}
+
 /// 用户送她一样礼物。随机挑一件——拆盲盒比让人从二十项里选更有意思。
 /// 礼物不花她的钱，钱是用户出的。
 #[tauri::command]
@@ -385,9 +406,10 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let toggle = MenuItem::with_id(app, "toggle", "显示 / 隐藏", true, None::<&str>)?;
     // 穿透在 Windows 上是有坑的一项（docs/07 风险表），留个能当场关掉的开关
     let passthrough = CheckMenuItem::with_id(app, "passthrough", "鼠标穿透", true, true, None::<&str>)?;
+    let panel = MenuItem::with_id(app, "panel", "面板", true, None::<&str>)?;
     let gift = MenuItem::with_id(app, "gift", "送她礼物", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&toggle, &gift, &passthrough, &quit])?;
+    let menu = Menu::with_items(app, &[&toggle, &panel, &gift, &passthrough, &quit])?;
 
     let mut builder = TrayIconBuilder::with_id("main")
         .menu(&menu)
@@ -395,6 +417,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         .tooltip("VPet")
         .on_menu_event(|app, event| match event.id().as_ref() {
             "toggle" => toggle_pet(app),
+            "panel" => open_panel(app),
             "gift" => {
                 give_gift(app.clone());
             }

@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "panel",
+  "description": "面板窗口：只订阅事件和调 Core 的命令，不碰窗口位置",
+  "windows": ["panel"],
+  "permissions": ["core:default"]
+}
