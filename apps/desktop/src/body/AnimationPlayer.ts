@@ -1,4 +1,4 @@
-import type { GraphClip, GraphType, Manifest, Mood } from '@vpet/shared'
+import type { Animat, GraphClip, GraphType, Manifest, Mood } from '@vpet/shared'
 import { PET_BASE, pick, resolveClips } from './manifest'
 
 export interface PlayTarget {
@@ -8,7 +8,11 @@ export interface PlayTarget {
   mood?: Mood
 }
 
-type Phase = 'start' | 'loop' | 'end'
+/** 'step' = 由外部状态机编排的单段播放，见 playStep */
+type Phase = 'start' | 'loop' | 'end' | 'step'
+
+/** 解码后的帧缓存上限。ImageBitmap 按 RGBA8 估算：size×size×4 字节/帧 */
+const MAX_CACHED_BYTES = 192 * 1024 * 1024
 
 /**
  * Canvas 2D 帧动画播放器。
@@ -20,8 +24,9 @@ type Phase = 'start' | 'loop' | 'end'
 export class AnimationPlayer {
   private readonly ctx: CanvasRenderingContext2D
   private readonly cache = new Map<string, ImageBitmap[]>()
-  private readonly maxCachedClips = 40
+  private cachedBytes = 0
 
+  private stepDone: (() => void) | null = null
   private target: Required<PlayTarget> | null = null
   private phase: Phase = 'loop'
   private clip: GraphClip | null = null
@@ -57,6 +62,7 @@ export class AnimationPlayer {
     const gen = ++this.generation
     this.target = { type: t.type, name: t.name ?? t.type, mood: t.mood ?? 'nomal' }
     this.stopping = false
+    this.stepDone = null
 
     const start = this.resolve('start')
     const loop = this.resolve('loop')
@@ -78,9 +84,33 @@ export class AnimationPlayer {
     this.stopping = true
   }
 
+  /**
+   * 只播一个段落，结束后回调，不自动接后续段落——供外部状态机逐段编排。
+   * 提起就是这么拼的：raised_dynamic×3 → raised_static start → loop → end
+   * （原版 MainDisplay.DisplayRaising 的 rasetype 递归，legacy MainDisplay.cs:370-416）。
+   */
+  async playStep(t: PlayTarget, animat: Animat, onDone?: () => void): Promise<void> {
+    const gen = ++this.generation
+    this.target = { type: t.type, name: t.name ?? t.type, mood: t.mood ?? 'nomal' }
+    this.stopping = false
+    const clips = this.resolve(animat)
+    if (!clips.length) {
+      this.stepDone = null
+      onDone?.()
+      return
+    }
+    this.stepDone = onDone ?? null
+    await this.switchTo(pick(clips), 'step', gen)
+  }
+
   /** 请求结束：当前 loop 跑完后进入 end 段，播完触发 onIdle */
   stop(): void {
     this.stopping = true
+  }
+
+  /** 帧缓存占用，用来盯住内存预算 */
+  stats(): { clips: number; bytes: number } {
+    return { clips: this.cache.size, bytes: this.cachedBytes }
   }
 
   destroy(): void {
@@ -88,6 +118,7 @@ export class AnimationPlayer {
     cancelAnimationFrame(this.raf)
     for (const frames of this.cache.values()) frames.forEach((b) => b.close())
     this.cache.clear()
+    this.cachedBytes = 0
   }
 
   /* ------------------------------------------------------------ */
@@ -134,6 +165,13 @@ export class AnimationPlayer {
 
   private async onClipEnd(): Promise<void> {
     const gen = this.generation
+    if (this.phase === 'step') {
+      const done = this.stepDone
+      this.stepDone = null
+      this.clip = null
+      if (gen === this.generation) done?.()
+      return
+    }
     if (this.phase === 'start') {
       const loop = this.resolve('loop')
       const single = this.resolve('single')
@@ -191,13 +229,20 @@ export class AnimationPlayer {
       return frames
     }
     this.cache.set(clip.id, frames)
-    while (this.cache.size > this.maxCachedClips) {
+    this.cachedBytes += this.bytesOf(frames.length)
+    // 刚放进来的和正在播的都是最近使用的，不会排在队首，所以 break 只是兜底
+    while (this.cachedBytes > MAX_CACHED_BYTES && this.cache.size > 1) {
       const [oldestId, oldest] = this.cache.entries().next().value as [string, ImageBitmap[]]
-      if (oldestId === this.clip?.id) break
+      if (oldestId === this.clip?.id || oldestId === clip.id) break
       oldest.forEach((b) => b.close())
       this.cache.delete(oldestId)
+      this.cachedBytes -= this.bytesOf(oldest.length)
     }
     return frames
+  }
+
+  private bytesOf(frameCount: number): number {
+    return frameCount * this.manifest.size * this.manifest.size * 4
   }
 
   private async preload(clips: GraphClip[]): Promise<void> {
