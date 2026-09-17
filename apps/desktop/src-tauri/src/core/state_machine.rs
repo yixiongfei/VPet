@@ -215,6 +215,17 @@ pub(crate) const SAD: f32 = 40.0;
 /// 钱少于此就该去挣了
 pub(crate) const BROKE: f32 = 80.0;
 
+/* --- 迟滞：触发线在低位，**解除线在高位**。
+   两条线合一是抖振的充要条件——心情 15 去玩，涨到 16 就被「上班时间」抢回去，
+   掉回 15 又被抢走，两分钟翻一次。分开之后一个来回要几十分钟，
+   看起来才像「歇够了再回去干活」。 --- */
+
+/// 缓过这口气才算歇完
+const RECOVERED_FEELING: f32 = 35.0;
+const RECOVERED_STRENGTH: f32 = 40.0;
+const RECOVERED_HUNGER: f32 = 45.0;
+const RECOVERED_THIRST: f32 = 45.0;
+
 const HAPPY_FEELING: f32 = 70.0;
 const NOMAL_FEELING: f32 = 40.0;
 const POOR_STRENGTH: f32 = 20.0;
@@ -477,6 +488,19 @@ fn should_switch(cat: &Catalog, n: &Pet, hour: f32) -> bool {
     if let Some(tag) = n.pinned_tag.as_deref() {
         return !cur.has_tag(tag);
     }
+    // 正在缓这口气就别打断：解除线比触发线高一截（见上面的迟滞注释）。
+    // 放在生理急需之后——真出大事了照样能把她拽走
+    for (tag, value, recovered) in [
+        ("cheer", n.state.feeling, RECOVERED_FEELING),
+        ("sleep", n.state.strength, RECOVERED_STRENGTH),
+        ("eat", n.state.hunger, RECOVERED_HUNGER),
+        ("drink", n.state.thirst, RECOVERED_THIRST),
+    ] {
+        if cur.has_tag(tag) && value < recovered {
+            return false;
+        }
+    }
+
     // 排了时段的事，过了点就收手（下班了就别干了）
     if cur.is_scheduled() && !cur.fits_hour(hour) {
         return true;
@@ -1338,6 +1362,58 @@ mod tests {
         }
         assert!(json.contains("\"idle\""));
         assert!(json.contains("\"nomal\""));
+    }
+
+    /* ---------- 迟滞：触发线和解除线分开 ---------- */
+
+    #[test]
+    fn 心情崩了之后不会在阈值上来回抽搐() {
+        let c = cat();
+        let mut p = Pet::default();
+        p.state.feeling = 14.0; // 刚跌破 MISERABLE
+        // 下午三点，作息层会抢着让她上班——迟滞就是防这一下
+        let mut flips = 0;
+        let mut last = String::new();
+        for i in 0..90 {
+            p = reduce(&c, &shelf(), &p, &Event::Tick { minutes: 1.0, hour: 15.0 + i as f32 / 60.0 });
+            let now = p.state.action.as_ref().map(|a| a.id.clone()).unwrap_or_default();
+            if now != last {
+                flips += 1;
+                last = now;
+            }
+        }
+        // 没有迟滞时这里会翻四十多次（每两分钟一次）
+        assert!(flips < 8, "一个半小时里换了 {flips} 次事情做");
+    }
+
+    #[test]
+    fn 歇到缓过来了才回去干活() {
+        let c = cat();
+        let mut p = Pet::default();
+        p.state.feeling = 14.0;
+        // 先让她进入「找点乐子」
+        p = reduce(&c, &shelf(), &p, &Event::Tick { minutes: 1.0, hour: 15.0 });
+        let playing = p.state.action.as_ref().unwrap().id.clone();
+        assert!(c.get(&playing).unwrap().has_tag("cheer"), "应该先去缓一缓，而不是 {playing}");
+        // 心情刚爬过触发线还不能被拽走
+        p.state.feeling = MISERABLE + 5.0;
+        p = reduce(&c, &shelf(), &p, &Event::Tick { minutes: 1.0, hour: 15.1 });
+        assert_eq!(p.state.action.as_ref().unwrap().id, playing, "刚过 15 就被抢走了");
+        // 缓过解除线才松手
+        p.state.feeling = RECOVERED_FEELING + 5.0;
+        p = reduce(&c, &shelf(), &p, &Event::Tick { minutes: 1.0, hour: 15.2 });
+        assert_ne!(p.state.action.as_ref().unwrap().id, playing, "缓过来了还赖着不走");
+    }
+
+    #[test]
+    fn 缓着的时候真出大事照样拽得走() {
+        let c = cat();
+        let mut p = Pet::default();
+        p.state.feeling = 20.0; // 在触发线和解除线之间，正缓着
+        p = reduce(&c, &shelf(), &p, &Event::Tick { minutes: 1.0, hour: 15.0 });
+        p.state.hunger = 5.0; // 饿垮了
+        p = reduce(&c, &shelf(), &p, &Event::Tick { minutes: 1.0, hour: 15.1 });
+        assert_eq!(p.state.activity, Activity::Eating, "迟滞不该压过生理急需");
     }
 
     /* ---------- 好感度与服从（roadmap 2.8） ---------- */
