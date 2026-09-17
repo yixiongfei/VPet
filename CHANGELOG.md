@@ -3,6 +3,8 @@
 ## 未发布 · Phase 1「Body MVP」进行中
 
 ### 新增
+- **状态 → 动画映射**（roadmap 1.6）：Body 订阅 Core 的 `pet:state`，按 `CLIP_FOR` 表切到该活动的循环动画（idle→default、working→workone、studying→study、break→idel、sleeping→sleep、playing→playone），心情同步换到对应心情的变体。载荷用 zod 校验，不合法只 warn 不崩。摸头/提起进行中收到新状态不打断，等交互结束自然切过去；非 idle 活动不再乱插空闲小动作。
+- **假状态源** `debug_set_pet_state`（Rust）：手动推一个 `pet:state` 给 Body，用来调映射；Phase 2 真状态机上线后删掉。浏览器预览里对应 `window.dispatchEvent(new CustomEvent('pet:state', { detail }))`。
 - **触摸交互**（roadmap 1.3）：移植原版 `Main.xaml.cs` 的鼠标语义——短按（< 500 ms）命中头/身体区域 → 摸头 / 摸身体；长按命中提起区 → 挣扎 ×3 → 静止循环，窗口跟住光标；松手 → 当前段播完落地回默认。判定用松手那一刻的光标位置，与原版一致。
 - **`pet.json` 契约** `packages/shared/src/profile.ts`：把 `vup.lps` 平铺的 `happy_px` / `nomal_px` … 收回成 `Record<Mood, Rect>`；触摸区域坐标统一在 500×500 逻辑参考系。
 - `AnimationPlayer.playStep()`：只播一个段落并回调，供外部状态机逐段编排（提起就是这么拼的）。

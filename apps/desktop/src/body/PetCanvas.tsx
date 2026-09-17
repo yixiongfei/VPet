@@ -1,12 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
-import type { Mood } from '@vpet/shared'
 import { AnimationPlayer } from './AnimationPlayer'
 import { Interaction } from './interaction'
 import { loadManifest, loadProfile } from './manifest'
+import { subscribePetState } from './petState'
 import { toLogical } from './touch'
-
-/** Phase 0：默认心情。Phase 2 起改为订阅 Core 的 `pet:state` 事件。 */
-const MOOD: Mood = 'nomal'
 
 export function PetCanvas() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -19,15 +16,17 @@ export function PetCanvas() {
     if (!canvas) return
     let disposed = false
     let player: AnimationPlayer | null = null
+    let unsubscribe: (() => void) | null = null
 
     Promise.all([loadManifest(), loadProfile()])
       .then(([manifest, profile]) => {
         if (disposed) return
         setSize(manifest.size)
         player = new AnimationPlayer(canvas, manifest)
-        const interaction = new Interaction({ player, manifest, profile, mood: () => MOOD })
+        const interaction = new Interaction({ player, manifest, profile })
         interactionRef.current = interaction
         interaction.start()
+        unsubscribe = subscribePetState((s) => interaction.setState(s))
         console.info(
           `[VPet] ${profile.name} 载入：${manifest.clips.length} clips · ${manifest.size}px · ${manifest.generatedAt}`,
         )
@@ -36,6 +35,7 @@ export function PetCanvas() {
 
     return () => {
       disposed = true
+      unsubscribe?.()
       interactionRef.current?.dispose()
       interactionRef.current = null
       player?.destroy()

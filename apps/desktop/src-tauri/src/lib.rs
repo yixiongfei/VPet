@@ -7,7 +7,7 @@
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Manager, PhysicalPosition, WebviewWindow,
+    AppHandle, Emitter, Manager, PhysicalPosition, WebviewWindow,
 };
 
 const PET_WINDOW: &str = "pet";
@@ -15,6 +15,14 @@ const PET_WINDOW: &str = "pet";
 #[tauri::command]
 fn app_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
+}
+
+/// Phase 1 的假状态源：把调用方给的载荷原样当 `pet:state` 发给 Body，用来调
+/// 「活动/心情 → 动画」的映射。Phase 2 起改由 `core/state_machine.rs` 的真状态机发，
+/// 这个命令随之删掉。载荷形状由前端的 zod `PetState` 把关（docs/03 §5 事件面）。
+#[tauri::command]
+fn debug_set_pet_state(app: AppHandle, state: serde_json::Value) -> Result<(), String> {
+    app.emit("pet:state", state).map_err(|e| e.to_string())
 }
 
 pub fn run() {
@@ -29,7 +37,7 @@ pub fn run() {
             log::info!("VPet {} 启动", env!("CARGO_PKG_VERSION"));
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![app_version])
+        .invoke_handler(tauri::generate_handler![app_version, debug_set_pet_state])
         .run(tauri::generate_context!())
         .expect("VPet 运行失败");
 }
