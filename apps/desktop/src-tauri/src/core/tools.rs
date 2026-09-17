@@ -297,6 +297,74 @@ pub fn builtin_tools() -> Vec<ToolDef> {
             Level::Write,
         ),
         body(
+            "remember",
+            "记住一件关于用户的事。content 写成简洁的第三人称摘要（「用户正在准备 2027 考研」），\
+             不要原样抄对话。type 可选 profile/preference/habit/temporary_context/relationship/commitment，\
+             不给就按内容猜。**普通闲聊不要调这个**——只在用户明确要求记住、\
+             或者说出了会长期有用的事实时才调",
+            obj(
+                json!({
+                    "content": { "type": "string", "description": "简洁的记忆摘要" },
+                    "type": {
+                        "type": "string",
+                        "enum": ["profile", "preference", "habit", "temporary_context", "relationship", "commitment"]
+                    },
+                    "importance": { "type": "number", "description": "0–100，默认 70" },
+                    "confidence": { "type": "number", "description": "0–1，默认 1.0" },
+                    "source": {
+                        "type": "string",
+                        "enum": ["user_explicit", "user_confirmed", "inferred", "system_event"],
+                        "description": "你自己推断出来的必须写 inferred——那样不会直接落库，会先问用户"
+                    },
+                    "ttlMs": { "type": "number", "description": "多久之后失效（毫秒）" }
+                }),
+                &["content"],
+            ),
+            Level::Write,
+        ),
+        body(
+            "forget_memory",
+            "忘掉和这句话最相关的那条记忆。query 写记忆 id 或者内容的大意",
+            obj(json!({ "query": { "type": "string" } }), &["query"]),
+            Level::Write,
+        ),
+        body(
+            "search_memory",
+            "按当前问题检索相关记忆，按语义相似度 + 重要性 + 新鲜度 + 使用频次 + 置信度排序",
+            obj(
+                json!({
+                    "query": { "type": "string", "description": "用户当前的问题" },
+                    "limit": { "type": "number", "description": "最多几条，默认 5" }
+                }),
+                &["query"],
+            ),
+            Level::Read,
+        ),
+        body(
+            "memory_context",
+            "拿到可以直接放进提示词的那段记忆上下文（已按固定格式成文，含使用规则）",
+            obj(json!({ "query": { "type": "string" } }), &["query"]),
+            Level::Read,
+        ),
+        body(
+            "pin_memory",
+            "把某条记忆置顶：永久保留，且不管问什么都进候选",
+            obj(
+                json!({
+                    "id": { "type": "string" },
+                    "pinned": { "type": "boolean", "description": "默认 true" }
+                }),
+                &["id"],
+            ),
+            Level::Write,
+        ),
+        body(
+            "memory_health",
+            "看看记忆库的健康度：活跃/归档/删除各多少、多少条真的被用过、要不要打扫",
+            obj(json!({}), &[]),
+            Level::Read,
+        ),
+        body(
             "set_bias",
             "调整她做某一类事的倾向。tag 只能是 work / study / play（吃喝睡是生理，调不了）。\
              weight 正数 = 多做，负数 = 少做，范围 ±2。halfLife 是半衰期（分钟），不给按 120。\

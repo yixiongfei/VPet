@@ -5,6 +5,7 @@ pub mod actions;
 pub mod bias;
 pub mod db;
 pub mod food;
+pub mod memory;
 pub mod obey;
 pub mod pomodoro;
 pub mod scheduler;

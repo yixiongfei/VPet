@@ -40,6 +40,56 @@ const mmss = (sec: number) => {
   return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`
 }
 
+interface MemoryRow {
+  id: string
+  content: string
+  type: string
+  importance: number
+  confidence: number
+  source: string
+  pinned: boolean
+  createdAt: number
+  updatedAt: number
+  lastAccessedAt: number
+  accessCount: number
+  expiresAt: number | null
+  status: 'active' | 'archived' | 'deleted'
+}
+
+interface MemoryHealth {
+  active: number
+  archived: number
+  deleted: number
+  expired: number
+  usedRatio: number
+  avgImportance: number
+  needsSweep: number
+}
+
+const MEM_TYPE_LABEL: Record<string, string> = {
+  profile: '长期',
+  preference: '偏好',
+  habit: '习惯',
+  temporary_context: '临时',
+  relationship: '互动',
+  commitment: '约定',
+}
+
+const MEM_SOURCE_LABEL: Record<string, string> = {
+  user_explicit: '你说的',
+  user_confirmed: '你确认过',
+  inferred: '推断·未确认',
+  system_event: '系统记的',
+}
+
+const MEM_STATUS_COLOR: Record<MemoryRow['status'], string> = {
+  active: '#7cc47f',
+  archived: '#8a8a93',
+  deleted: '#e06c75',
+}
+
+const ymd = (ms: number) => new Date(ms).toISOString().slice(0, 10)
+
 interface BiasRow {
   tag: string
   weight: number
@@ -74,6 +124,10 @@ export function Panel() {
   const [audit, setAudit] = useState<AuditRow[]>([])
   const [verdict, setVerdict] = useState<Verdict | null>(null)
   const [biases, setBiases] = useState<BiasRow[]>([])
+  const [mems, setMems] = useState<MemoryRow[]>([])
+  const [memHealth, setMemHealth] = useState<MemoryHealth | null>(null)
+  const [memQuery, setMemQuery] = useState('')
+  const [memCtx, setMemCtx] = useState('')
 
   useEffect(() => {
     void invokeCore<string>('app_version').then((v) => v && setVersion(v))
@@ -83,6 +137,8 @@ export function Panel() {
       void invokeCore<Pomo | null>('get_pomodoro').then(setPomo)
       void invokeCore<AuditRow[]>('recent_audit', { limit: 12 }).then((a) => a && setAudit(a))
       void invokeCore<BiasRow[]>('list_biases').then((b) => b && setBiases(b))
+      void invokeCore<MemoryRow[]>('list_memories').then((m) => m && setMems(m))
+      void invokeCore<MemoryHealth>('memory_health').then(setMemHealth)
     }
     pull()
     const timer = window.setInterval(pull, REFRESH_MS)
@@ -94,6 +150,20 @@ export function Panel() {
   }, [])
 
   const patch = (p: Record<string, number>) => void invokeCore('debug_patch_pet_state', p)
+  const pullMems = () => {
+    void invokeCore<MemoryRow[]>('list_memories').then((m) => m && setMems(m))
+    void invokeCore<MemoryHealth>('memory_health').then(setMemHealth)
+  }
+  const memStatus = (id: string, status: string) =>
+    void invokeCore('set_memory_status', { id, status }).then(pullMems)
+  const memPin = (id: string, pinned: boolean) =>
+    void invokeCore('pin_memory', { id, pinned }).then(pullMems)
+  /** 预览「这个问题会带上哪些记忆」——排序的黑盒不给人看就成了玄学 */
+  const previewCtx = () =>
+    void invokeCore<string>('memory_context', { query: memQuery }).then((c) => {
+      setMemCtx(c ?? '')
+      pullMems()
+    })
   const bias = (tag: string, weight: number) =>
     void invokeCore<BiasRow[]>('set_bias', { tag, weight }).then((b) => b && setBiases(b))
   const unbias = (tag?: string) =>
@@ -175,6 +245,101 @@ export function Panel() {
                   （这次有 {(verdict.p * 100).toFixed(0)}% 会听{verdict.refusal ? ` · ${verdict.refusal}` : ''}）
                 </span>
               </p>
+            )}
+          </Card>
+
+          <Card title="她记得什么">
+            {memHealth && (
+              <p style={{ margin: '0 0 12px', color: '#8a8a93', fontSize: 13 }}>
+                活跃 {memHealth.active} · 归档 {memHealth.archived} · 已删 {memHealth.deleted} ·
+                被用过 {(memHealth.usedRatio * 100).toFixed(0)}% · 平均重要性{' '}
+                {memHealth.avgImportance.toFixed(0)}
+                {memHealth.needsSweep > 0 && (
+                  <span style={{ color: '#e0a458' }}> · {memHealth.needsSweep} 条待打扫</span>
+                )}
+              </p>
+            )}
+            <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
+              <input
+                value={memQuery}
+                onChange={(e) => setMemQuery(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && previewCtx()}
+                placeholder="试一个问题，看会带上哪些记忆"
+                style={{
+                  flex: 1,
+                  background: '#2c2c32',
+                  border: '1px solid #3a3a42',
+                  borderRadius: 6,
+                  color: '#e8e8ea',
+                  padding: '6px 10px',
+                  fontSize: 14,
+                }}
+              />
+              <Btn onClick={previewCtx}>检索</Btn>
+            </div>
+            {memCtx && (
+              <pre
+                style={{
+                  background: '#202026',
+                  border: '1px solid #3a3a42',
+                  borderRadius: 6,
+                  padding: 10,
+                  fontSize: 12,
+                  color: '#a8d5a2',
+                  whiteSpace: 'pre-wrap',
+                  margin: '0 0 12px',
+                }}
+              >
+                {memCtx}
+              </pre>
+            )}
+            {mems.length === 0 ? (
+              <p style={{ margin: 0, color: '#8a8a93', fontSize: 13 }}>
+                她还什么都没记住。对着她说「记住：…」试试。
+              </p>
+            ) : (
+              <ul style={{ listStyle: 'none', margin: 0, padding: 0 }}>
+                {mems.map((m) => (
+                  <li
+                    key={m.id}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'baseline',
+                      gap: 8,
+                      fontSize: 13,
+                      marginBottom: 8,
+                      opacity: m.status === 'active' ? 1 : 0.5,
+                    }}
+                  >
+                    <span style={{ color: MEM_STATUS_COLOR[m.status], fontSize: 11 }}>●</span>
+                    <span style={{ color: '#8ab4f8', width: 36 }}>
+                      {MEM_TYPE_LABEL[m.type] ?? m.type}
+                    </span>
+                    <span
+                      style={{
+                        flex: 1,
+                        textDecoration: m.status === 'deleted' ? 'line-through' : 'none',
+                      }}
+                    >
+                      {m.pinned && '📌 '}
+                      {m.content}
+                    </span>
+                    <span style={{ color: '#8a8a93', fontSize: 11, whiteSpace: 'nowrap' }}>
+                      {MEM_SOURCE_LABEL[m.source] ?? m.source} · 重{m.importance.toFixed(0)} · 用
+                      {m.accessCount}
+                      {m.expiresAt && ` · 至${ymd(m.expiresAt)}`}
+                    </span>
+                    {m.status === 'active' && (
+                      <>
+                        <Btn onClick={() => memPin(m.id, !m.pinned)}>{m.pinned ? '取消置顶' : '置顶'}</Btn>
+                        <Btn onClick={() => memStatus(m.id, 'archived')}>归档</Btn>
+                        <Btn onClick={() => memStatus(m.id, 'deleted')}>删除</Btn>
+                      </>
+                    )}
+                    {m.status === 'archived' && <Btn onClick={() => memStatus(m.id, 'active')}>恢复</Btn>}
+                  </li>
+                ))}
+              </ul>
             )}
           </Card>
 

@@ -86,3 +86,77 @@ export const Verdict = z.object({
   say: z.string(),
 })
 export type Verdict = z.infer<typeof Verdict>
+
+/* ==================== 长期互动记忆（roadmap 2.11） ==================== */
+
+/** 记忆类型。决定它的默认有效期和在上下文里的标签 */
+export const MemoryType = z.enum([
+  /** 稳定身份与目标：「准备 2027 考研」 */
+  'profile',
+  /** 偏好：「学习时不喜欢频繁打扰」 */
+  'preference',
+  /** 习惯：「晚上工作，白天学习」 */
+  'habit',
+  /** 临时状态：「本周在赶项目」。自带有效期 */
+  'temporary_context',
+  /** 角色互动摘要：「送过礼物，好感上升」 */
+  'relationship',
+  /** 约定或计划：「明天提醒复习行列式」。自带截止日期 */
+  'commitment',
+])
+export type MemoryType = z.infer<typeof MemoryType>
+
+/**
+ * 这条记忆是怎么来的。**冲突时的优先级就是这个顺序**（从高到低）：
+ * user_explicit > user_confirmed > system_event > inferred。
+ * 未确认的推断永远不进模型上下文。
+ */
+export const MemorySource = z.enum(['user_explicit', 'user_confirmed', 'system_event', 'inferred'])
+export type MemorySource = z.infer<typeof MemorySource>
+
+/** active 才进上下文；archived 可恢复；deleted 是软删除，行留着当审计 */
+export const MemoryStatus = z.enum(['active', 'archived', 'deleted'])
+export type MemoryStatus = z.infer<typeof MemoryStatus>
+
+export const MemoryItem = z.object({
+  id: z.string(),
+  /** 简洁、可读的记忆摘要。**不是原始对话** */
+  content: z.string(),
+  type: MemoryType,
+  importance: z.number().min(0).max(100),
+  confidence: z.number().min(0).max(1),
+  source: MemorySource,
+  /** 置顶的永不自动淘汰，且不管问什么都进候选 */
+  pinned: z.boolean(),
+  createdAt: z.number().int(),
+  updatedAt: z.number().int(),
+  lastAccessedAt: z.number().int(),
+  accessCount: z.number().int().min(0),
+  expiresAt: z.number().int().nullish(),
+  status: MemoryStatus,
+  /** 算相似度用的是哪一版表示。换模型后按它筛出要重算的 */
+  embeddingVersion: z.string(),
+  /** 被取代的上一版。那条链就是「这条记忆怎么变成今天这样」的审计 */
+  parentId: z.string().nullish(),
+})
+export type MemoryItem = z.infer<typeof MemoryItem>
+
+/** 一次检索命中。`similarity` 和 `score` 都带出来，是为了排序能被人检查 */
+export const MemoryHit = z.object({
+  item: MemoryItem,
+  similarity: z.number().min(0).max(1),
+  score: z.number(),
+})
+export type MemoryHit = z.infer<typeof MemoryHit>
+
+/** 记忆库健康度。`usedRatio` 低说明检索被一堆没人看的旧条目稀释了 */
+export const MemoryHealth = z.object({
+  active: z.number().int(),
+  archived: z.number().int(),
+  deleted: z.number().int(),
+  expired: z.number().int(),
+  usedRatio: z.number().min(0).max(1),
+  avgImportance: z.number(),
+  needsSweep: z.number().int(),
+})
+export type MemoryHealth = z.infer<typeof MemoryHealth>

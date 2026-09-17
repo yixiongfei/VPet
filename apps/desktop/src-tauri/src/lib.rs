@@ -20,6 +20,10 @@ use core::tools::{
     PermissionGate, ToolCall, ToolDef, ToolResult,
 };
 use core::bias::{BiasView, DEFAULT_HALF_LIFE};
+use core::memory::{
+    self, BigramRetriever, Command, Health, Hit, MemoryItem, MemoryType, Retriever, Source, Status,
+    WriteOutcome,
+};
 use core::obey::Verdict;
 use core::state_machine::{catch_up, reduce, Event, Pet, PetState, Touch};
 
@@ -231,6 +235,8 @@ fn spawn_pet_clock(app: AppHandle) {
             if last_persist.elapsed() >= PERSIST_EVERY {
                 last_persist = Instant::now();
                 persist(&app, &next);
+                // 记忆的例行打扫跟着落库走，不另起时钟（和调度器同一个理由）
+                sweep_memories(&app);
             }
         }
     });
@@ -345,6 +351,251 @@ fn roll() -> f32 {
         x ^= x << 17;
         s.set(x);
         (x >> 40) as f32 / (1u32 << 24) as f32
+    })
+}
+
+/* ==================== 长期记忆（roadmap 2.11） ==================== */
+
+/// 现在用的相似度实现。Phase 4 换成本地 embedding 模型时只改这一处，
+/// 上面所有调用方都不用动——这正是把它做成 trait 的理由
+fn retriever() -> BigramRetriever {
+    BigramRetriever
+}
+
+fn memories(app: &AppHandle) -> Vec<MemoryItem> {
+    let Some(db) = app.try_state::<Mutex<Db>>() else { return Vec::new() };
+    db.lock()
+        .ok()
+        .and_then(|d| d.all_memories().ok())
+        .unwrap_or_default()
+}
+
+fn new_memory_id() -> String {
+    format!("m{}-{:04}", now_ms(), (roll() * 9999.0) as u32)
+}
+
+/// 记一件事。
+///
+/// 返回 `WriteOutcome`：可能是新增、可能是**更新了旧的那条**（用户在纠正信息，
+/// 不该新增一条互相矛盾的），也可能是 `NeedsConfirm`——推断出来的或者内容敏感的
+/// 不会直接落库，得用户先点头。判断在 `memory::plan_write` 里，这里只负责落盘。
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn remember(
+    app: AppHandle,
+    content: String,
+    kind: Option<String>,
+    importance: Option<f32>,
+    confidence: Option<f32>,
+    source: Option<String>,
+    ttl_ms: Option<i64>,
+) -> Result<WriteOutcome, String> {
+    let content = content.trim().to_string();
+    if content.is_empty() {
+        return Err("内容是空的".into());
+    }
+    let now = now_ms();
+    let r = retriever();
+    // 没指定类型就按内容猜；猜出来的有效期只在调用方没给时才用
+    let (guessed_kind, guessed_ttl) = memory::classify(&content);
+    let kind = kind
+        .and_then(|k| MemoryType::parse(&k))
+        .unwrap_or(guessed_kind);
+    let source = source
+        .and_then(|s| Source::parse(&s))
+        .unwrap_or(Source::UserExplicit);
+    let expires_at = ttl_ms.or(guessed_ttl).map(|t| now + t);
+
+    let candidate = memory::draft(
+        new_memory_id(),
+        content,
+        kind,
+        importance.unwrap_or(70.0),
+        confidence.unwrap_or(1.0),
+        source,
+        expires_at,
+        r.version(),
+        now,
+    );
+    let outcome = memory::plan_write(&memories(&app), candidate, &r, now);
+
+    // NeedsConfirm 不落库——这是「推断不能当事实」的执行点，别在这儿放水
+    if let WriteOutcome::Created { item } | WriteOutcome::Updated { item, .. } = &outcome {
+        let Some(db) = app.try_state::<Mutex<Db>>() else {
+            return Err("数据库没开".into());
+        };
+        let Ok(db) = db.lock() else { return Err("数据库被占住了".into()) };
+        db.put_memory(item).map_err(|e| e.to_string())?;
+        log::info!("记住了：{}（{}）", item.content, item.kind.as_str());
+    }
+    Ok(outcome)
+}
+
+/// 忘掉和这句话最相关的那条。返回被删掉的那条，让调用方能说出「我不记得…了」。
+///
+/// 软删除：行留在库里当审计，但 `usable()` 会把它挡在上下文之外
+#[tauri::command]
+fn forget_memory(app: AppHandle, query: String) -> Option<MemoryItem> {
+    let now = now_ms();
+    let r = retriever();
+    let all = memories(&app);
+    // 按 id 直接删，或者按内容找最像的那条
+    let target = all
+        .iter()
+        .find(|m| m.id == query && m.status != Status::Deleted)
+        .or_else(|| {
+            all.iter()
+                .filter(|m| m.status == Status::Active)
+                .map(|m| (m, r.similarity(&query, &m.content)))
+                .filter(|(_, s)| *s >= 0.2)
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(m, _)| m)
+        })?
+        .clone();
+    let db = app.try_state::<Mutex<Db>>()?;
+    let d = db.lock().ok()?;
+    d.set_memory_status(&target.id, Status::Deleted, now).ok()?;
+    log::info!("忘掉了：{}", target.content);
+    Some(target)
+}
+
+/// 检索：给一句话，回最相关的几条。**会记一次使用**——
+/// 使用频次占排序权重的 0.10，不记就是空话
+#[tauri::command]
+fn search_memory(app: AppHandle, query: String, limit: Option<usize>) -> Vec<Hit> {
+    let now = now_ms();
+    let k = limit.unwrap_or(memory::TOP_K).min(20);
+    let hits = memory::retrieve(&memories(&app), &query, &retriever(), now, k);
+    if let Some(db) = app.try_state::<Mutex<Db>>() {
+        if let Ok(d) = db.lock() {
+            let ids: Vec<String> = hits.iter().map(|h| h.item.id.clone()).collect();
+            let _ = d.touch_memories(&ids, now);
+        }
+    }
+    hits
+}
+
+/// 直接给模型用的那段文本（docs §7 的固定格式）。
+/// 没有相关记忆时返回空串——没记忆也塞一段提示词是在浪费 token
+#[tauri::command]
+fn memory_context(app: AppHandle, query: String) -> String {
+    memory::render_context(&search_memory(app, query, None))
+}
+
+/// 面板要看的：全部记忆，含归档和已删除的（那是审计）
+#[tauri::command]
+fn list_memories(app: AppHandle) -> Vec<MemoryItem> {
+    memories(&app)
+}
+
+#[tauri::command]
+fn memory_health(app: AppHandle) -> Health {
+    memory::health(&memories(&app), now_ms())
+}
+
+#[tauri::command]
+fn pin_memory(app: AppHandle, id: String, pinned: bool) -> bool {
+    let Some(db) = app.try_state::<Mutex<Db>>() else { return false };
+    let Ok(d) = db.lock() else { return false };
+    d.set_memory_pinned(&id, pinned, now_ms()).unwrap_or(false)
+}
+
+#[tauri::command]
+fn set_memory_status(app: AppHandle, id: String, status: String) -> bool {
+    let Some(st) = Status::parse(&status) else { return false };
+    let Some(db) = app.try_state::<Mutex<Db>>() else { return false };
+    let Ok(d) = db.lock() else { return false };
+    d.set_memory_status(&id, st, now_ms()).unwrap_or(false)
+}
+
+#[tauri::command]
+fn set_memory_importance(app: AppHandle, id: String, importance: f32) -> bool {
+    let Some(db) = app.try_state::<Mutex<Db>>() else { return false };
+    let Ok(d) = db.lock() else { return false };
+    d.set_memory_importance(&id, importance, now_ms()).unwrap_or(false)
+}
+
+/// 例行打扫：过期的失效，长期没用又不重要的归档。**不删东西**。
+/// 跟着心跳走，不另起时钟
+fn sweep_memories(app: &AppHandle) {
+    let now = now_ms();
+    let todo = memory::sweep(&memories(app), now);
+    if todo.is_empty() {
+        return;
+    }
+    let Some(db) = app.try_state::<Mutex<Db>>() else { return };
+    let Ok(d) = db.lock() else { return };
+    for (id, what) in todo {
+        // 过期和长期闲置都归档：归档是可逆的，删除必须是用户的动作
+        if d.set_memory_status(&id, Status::Archived, now).unwrap_or(false) {
+            log::info!("记忆归档：{id}（{what:?}）");
+        }
+    }
+}
+
+/// 用户这句话是不是在对记忆库下命令。是就执行，回一句话；不是就返回 None，
+/// 交给正常的对话流程——**普通闲聊默认不写长期记忆**
+#[tauri::command]
+fn memory_command(app: AppHandle, text: String) -> Option<String> {
+    let cmd = memory::parse_command(&text)?;
+    Some(match cmd {
+        Command::Remember { content, kind, importance, ttl_ms } => {
+            match remember(
+                app,
+                content.clone(),
+                Some(kind.as_str().into()),
+                Some(importance),
+                Some(1.0),
+                Some(Source::UserExplicit.as_str().into()),
+                ttl_ms,
+            ) {
+                Ok(WriteOutcome::Created { .. }) => format!("记住啦：{content}"),
+                Ok(WriteOutcome::Updated { replaced_content, .. }) => {
+                    format!("我改过来了，之前记的是「{replaced_content}」")
+                }
+                Ok(WriteOutcome::NeedsConfirm { item, why }) => why.question(&item.content),
+                Err(e) => format!("没记下来：{e}"),
+            }
+        }
+        Command::Forget { query } => match forget_memory(app, query.clone()) {
+            Some(m) => format!("好，我不记得「{}」了。", m.content),
+            None => format!("我本来就没记过「{query}」呀。"),
+        },
+        Command::Recall => {
+            let all = memories(&app);
+            let now = now_ms();
+            let mut live: Vec<&MemoryItem> = all.iter().filter(|m| m.usable(now)).collect();
+            live.sort_by(|a, b| {
+                (b.pinned, b.importance)
+                    .partial_cmp(&(a.pinned, a.importance))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            if live.is_empty() {
+                "我还什么都没记住呢。".into()
+            } else {
+                let lines: Vec<String> = live
+                    .iter()
+                    .take(8)
+                    .map(|m| format!("· [{}] {}", m.kind.label(), m.content))
+                    .collect();
+                format!("我记得这些：\n{}", lines.join("\n"))
+            }
+        }
+        Command::Pin { query } => match search_memory(app.clone(), query, Some(1)).first() {
+            Some(h) => {
+                pin_memory(app, h.item.id.clone(), true);
+                format!("好，「{}」我一直记着。", h.item.content)
+            }
+            None => "没找到你说的那条。".into(),
+        },
+        // 「别再根据这条回答」= 归档，不是删。用户想彻底删会说「忘记」
+        Command::Mute { query } => match search_memory(app.clone(), query, Some(1)).first() {
+            Some(h) => {
+                set_memory_status(app, h.item.id.clone(), "archived".into());
+                format!("好，「{}」我不拿来回答了。", h.item.content)
+            }
+            None => "没找到你说的那条。".into(),
+        },
     })
 }
 
@@ -470,6 +721,57 @@ fn execute(app: &AppHandle, call: &ToolCall) -> ToolResult {
                 Some(v) => ToolResult::ok(id, serde_json::to_value(v).unwrap_or_default()),
                 None => ToolResult::err(id, "invalid_input", "判定没出结果"),
             }
+        }
+        "remember" => {
+            let Some(content) = arg("content") else {
+                return ToolResult::err(id, "invalid_input", "缺 content");
+            };
+            let num = |k: &str| call.input.get(k).and_then(|v| v.as_f64()).map(|v| v as f32);
+            match remember(
+                app.clone(),
+                content,
+                arg("type"),
+                num("importance"),
+                num("confidence"),
+                arg("source"),
+                call.input.get("ttlMs").and_then(|v| v.as_i64()),
+            ) {
+                Ok(o) => ToolResult::ok(id, serde_json::to_value(o).unwrap_or_default()),
+                Err(e) => ToolResult::err(id, "invalid_input", e),
+            }
+        }
+        "forget_memory" => {
+            let Some(q) = arg("query") else {
+                return ToolResult::err(id, "invalid_input", "缺 query");
+            };
+            match forget_memory(app.clone(), q) {
+                Some(m) => ToolResult::ok(id, serde_json::to_value(m).unwrap_or_default()),
+                None => ToolResult::err(id, "not_found", "没找到对得上的记忆"),
+            }
+        }
+        "search_memory" => {
+            let Some(q) = arg("query") else {
+                return ToolResult::err(id, "invalid_input", "缺 query");
+            };
+            let limit = call.input.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
+            let hits = search_memory(app.clone(), q, limit);
+            ToolResult::ok(id, serde_json::to_value(hits).unwrap_or_default())
+        }
+        "memory_context" => {
+            let Some(q) = arg("query") else {
+                return ToolResult::err(id, "invalid_input", "缺 query");
+            };
+            ToolResult::ok(id, serde_json::json!({ "context": memory_context(app.clone(), q) }))
+        }
+        "pin_memory" => {
+            let Some(mid) = arg("id") else {
+                return ToolResult::err(id, "invalid_input", "缺 id");
+            };
+            let pinned = call.input.get("pinned").and_then(|v| v.as_bool()).unwrap_or(true);
+            ToolResult::ok(id, serde_json::json!({ "ok": pin_memory(app.clone(), mid, pinned) }))
+        }
+        "memory_health" => {
+            ToolResult::ok(id, serde_json::to_value(memory_health(app.clone())).unwrap_or_default())
         }
         "set_bias" => {
             let Some(tag) = arg("target").or_else(|| arg("tag")) else {
@@ -759,7 +1061,17 @@ pub fn run() {
             request_action,
             set_bias,
             clear_bias,
-            list_biases
+            list_biases,
+            remember,
+            forget_memory,
+            search_memory,
+            memory_context,
+            memory_command,
+            list_memories,
+            memory_health,
+            pin_memory,
+            set_memory_status,
+            set_memory_importance
         ])
         .build(tauri::generate_context!())
         .expect("VPet 启动失败")

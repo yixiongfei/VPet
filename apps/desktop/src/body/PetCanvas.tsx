@@ -7,6 +7,7 @@ import { subscribe } from './events'
 import { HitMask } from './hitMask'
 import { Interaction } from './interaction'
 import { loadManifest, loadProfile } from './manifest'
+import { invokeCore } from './ipc'
 import { fetchPetState, subscribePetState } from './petState'
 import { pushFoodCatalog, pushHitMask, reportTouch } from './petWindow'
 import { cannedReply, hideDelayMs } from './say'
@@ -109,6 +110,14 @@ export function PetCanvas() {
 
   /** 流式把一段回话吐进气泡。Phase 3 把 cannedReply 换成 Brain 的 token 流即可 */
   const say = useCallback(async (userText: string) => {
+    // 记忆命令（「记住：…」「忘记…」「你记得我什么」）先在 Core 里解析。
+    // 解析不出来才走对话——**普通闲聊不写长期记忆**，这是那条原则在前端的落点。
+    // 放在 Brain 之前是故意的：这些命令是确定性的，不该消耗一次模型调用
+    const memoryReply = await invokeCore<string | null>('memory_command', { text: userText })
+    if (memoryReply) {
+      announce(memoryReply)
+      return
+    }
     const gen = ++sayGen.current
     window.clearTimeout(hideTimer.current)
     interactionRef.current?.startSay()

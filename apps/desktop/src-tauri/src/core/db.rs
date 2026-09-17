@@ -7,6 +7,7 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension};
 
+use super::memory::{MemoryItem, MemoryType, Source, Status};
 use super::scheduler::Scheduler;
 use super::state_machine::Pet;
 
@@ -29,6 +30,36 @@ const MIGRATIONS: &[&str] = &[
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
     );
+    "#,
+    // v3：长期互动记忆（docs/07 roadmap 2.11）。
+    //
+    // 这张表**是真相来源**，所以每个字段都摊开成列，不像 `kv` 那样塞 JSON——
+    // 记忆要按 status 过滤、按 expires_at 扫、按 importance 排、逐条删，
+    // 这些都得让 SQLite 自己能做。向量索引（以后的 sqlite-vec）只是加速器，
+    // 丢了能从这张表重建；这张表丢了就真没了。
+    //
+    // 没有 ON DELETE CASCADE：parent_id 指向被取代的旧版本，
+    // 那条链正是「这条记忆是怎么变成今天这样的」的审计记录，不能跟着删。
+    r#"
+    CREATE TABLE memory_items (
+        id                TEXT    PRIMARY KEY,
+        content           TEXT    NOT NULL,
+        type              TEXT    NOT NULL,
+        importance        REAL    NOT NULL DEFAULT 50,
+        confidence        REAL    NOT NULL DEFAULT 1.0,
+        source            TEXT    NOT NULL,
+        pinned            INTEGER NOT NULL DEFAULT 0,
+        created_at        INTEGER NOT NULL,
+        updated_at        INTEGER NOT NULL,
+        last_accessed_at  INTEGER NOT NULL DEFAULT 0,
+        access_count      INTEGER NOT NULL DEFAULT 0,
+        expires_at        INTEGER,
+        status            TEXT    NOT NULL DEFAULT 'active',
+        embedding_version TEXT    NOT NULL DEFAULT '',
+        parent_id         TEXT
+    );
+    CREATE INDEX idx_memory_status  ON memory_items(status, updated_at DESC);
+    CREATE INDEX idx_memory_expires ON memory_items(expires_at) WHERE expires_at IS NOT NULL;
     "#,
 ];
 
@@ -137,6 +168,111 @@ impl Db {
             .optional()
     }
 
+    /* ---------- 长期记忆（docs/07 roadmap 2.11） ---------- */
+
+    /// 写一条。id 冲突就整条覆盖——`plan_write` 已经决定了是新增还是更新，
+    /// 「更新」在那边就是把旧 id 原样带回来，所以这里一个 upsert 够了
+    pub fn put_memory(&self, m: &MemoryItem) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO memory_items
+               (id, content, type, importance, confidence, source, pinned,
+                created_at, updated_at, last_accessed_at, access_count,
+                expires_at, status, embedding_version, parent_id)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+             ON CONFLICT(id) DO UPDATE SET
+               content = excluded.content,
+               type = excluded.type,
+               importance = excluded.importance,
+               confidence = excluded.confidence,
+               source = excluded.source,
+               pinned = excluded.pinned,
+               updated_at = excluded.updated_at,
+               expires_at = excluded.expires_at,
+               status = excluded.status,
+               embedding_version = excluded.embedding_version,
+               parent_id = excluded.parent_id",
+            rusqlite::params![
+                m.id, m.content, m.kind.as_str(), m.importance, m.confidence,
+                m.source.as_str(), m.pinned as i64,
+                m.created_at, m.updated_at, m.last_accessed_at, m.access_count as i64,
+                m.expires_at, m.status.as_str(), m.embedding_version, m.parent_id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 全部读出来，**含已删除的**——调用方要按 status 过滤。
+    /// 不在 SQL 里过滤是故意的：面板要能看到归档和删除的（那是审计），
+    /// 而「什么能进模型上下文」由 `MemoryItem::usable` 统一裁决，只此一处
+    pub fn all_memories(&self) -> rusqlite::Result<Vec<MemoryItem>> {
+        let mut st = self.conn.prepare(
+            "SELECT id, content, type, importance, confidence, source, pinned,
+                    created_at, updated_at, last_accessed_at, access_count,
+                    expires_at, status, embedding_version, parent_id
+             FROM memory_items ORDER BY updated_at DESC",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok(MemoryItem {
+                id: r.get(0)?,
+                content: r.get(1)?,
+                kind: MemoryType::parse(&r.get::<_, String>(2)?).unwrap_or(MemoryType::Profile),
+                importance: r.get(3)?,
+                confidence: r.get(4)?,
+                source: Source::parse(&r.get::<_, String>(5)?).unwrap_or(Source::Inferred),
+                pinned: r.get::<_, i64>(6)? != 0,
+                created_at: r.get(7)?,
+                updated_at: r.get(8)?,
+                last_accessed_at: r.get(9)?,
+                access_count: r.get::<_, i64>(10)? as u32,
+                expires_at: r.get(11)?,
+                status: Status::parse(&r.get::<_, String>(12)?).unwrap_or(Status::Active),
+                embedding_version: r.get(13)?,
+                parent_id: r.get(14)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// 改状态。**删除也走这里**——软删除，行留着当审计，
+    /// 但所有检索入口都按 status 过滤，所以它再也进不了模型上下文
+    pub fn set_memory_status(&self, id: &str, status: Status, now: i64) -> rusqlite::Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE memory_items SET status = ?2, updated_at = ?3 WHERE id = ?1",
+            rusqlite::params![id, status.as_str(), now],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn set_memory_pinned(&self, id: &str, pinned: bool, now: i64) -> rusqlite::Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE memory_items SET pinned = ?2, updated_at = ?3 WHERE id = ?1",
+            rusqlite::params![id, pinned as i64, now],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn set_memory_importance(&self, id: &str, importance: f32, now: i64) -> rusqlite::Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE memory_items SET importance = ?2, updated_at = ?3 WHERE id = ?1",
+            rusqlite::params![id, importance.clamp(0.0, 100.0), now],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// 命中一次就记一笔。使用频次占排序权重的 0.10——
+    /// 没有这一笔，「常被用到的记忆更可能再被用到」就是空话
+    pub fn touch_memories(&self, ids: &[String], now: i64) -> rusqlite::Result<()> {
+        for id in ids {
+            self.conn.execute(
+                "UPDATE memory_items
+                 SET access_count = access_count + 1, last_accessed_at = ?2
+                 WHERE id = ?1",
+                rusqlite::params![id, now],
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn save_scheduler(&self, s: &Scheduler) -> rusqlite::Result<()> {
         let json = serde_json::to_string(s)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
@@ -159,7 +295,138 @@ impl Db {
 mod tests {
     use super::*;
     use crate::core::bias::Biases;
+    use crate::core::memory::MemoryItem;
     use crate::core::state_machine::{Activity, Mood, PetState};
+
+    /* ---------- 长期记忆 ---------- */
+
+    fn mem(id: &str, content: &str) -> MemoryItem {
+        crate::core::memory::draft(
+            id.into(), content.into(), MemoryType::Habit, 70.0, 0.9,
+            Source::UserExplicit, None, "bigram-v1", 1_760_000_000_000,
+        )
+    }
+
+    #[test]
+    fn 记忆存得进读得回() {
+        let db = Db::open_in_memory().unwrap();
+        let m = mem("m1", "用户晚上上班白天学习");
+        db.put_memory(&m).unwrap();
+        let back = db.all_memories().unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0], m, "存回来的和存进去的不是同一条");
+    }
+
+    #[test]
+    fn 同一个_id_是覆盖不是新增() {
+        let db = Db::open_in_memory().unwrap();
+        db.put_memory(&mem("m1", "旧的说法")).unwrap();
+        let mut newer = mem("m1", "新的说法");
+        newer.updated_at += 1000;
+        db.put_memory(&newer).unwrap();
+        let back = db.all_memories().unwrap();
+        assert_eq!(back.len(), 1, "纠正旧信息时新增了一条");
+        assert_eq!(back[0].content, "新的说法");
+    }
+
+    #[test]
+    fn 删除是软删除_行还在但不可用() {
+        let db = Db::open_in_memory().unwrap();
+        db.put_memory(&mem("m1", "用户晚上上班")).unwrap();
+        let now = 1_760_000_000_000;
+        assert!(db.set_memory_status("m1", Status::Deleted, now).unwrap());
+        let back = db.all_memories().unwrap();
+        assert_eq!(back.len(), 1, "行应该留着当审计");
+        assert_eq!(back[0].status, Status::Deleted);
+        assert!(!back[0].usable(now), "删掉的还能进上下文");
+    }
+
+    #[test]
+    fn 删不存在的记忆不报错只回_false() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(!db.set_memory_status("nope", Status::Deleted, 0).unwrap());
+    }
+
+    #[test]
+    fn 命中会累加使用次数() {
+        let db = Db::open_in_memory().unwrap();
+        db.put_memory(&mem("m1", "甲")).unwrap();
+        db.touch_memories(&["m1".to_string()], 999).unwrap();
+        db.touch_memories(&["m1".to_string()], 1000).unwrap();
+        let back = db.all_memories().unwrap();
+        assert_eq!(back[0].access_count, 2);
+        assert_eq!(back[0].last_accessed_at, 1000);
+    }
+
+    #[test]
+    fn 置顶和重要性改得动() {
+        let db = Db::open_in_memory().unwrap();
+        db.put_memory(&mem("m1", "甲")).unwrap();
+        db.set_memory_pinned("m1", true, 1).unwrap();
+        db.set_memory_importance("m1", 100.0, 2).unwrap();
+        let back = db.all_memories().unwrap();
+        assert!(back[0].pinned);
+        assert_eq!(back[0].importance, 100.0);
+    }
+
+    /// 端到端走一遍 docs §9 的验收 1 / 2 / 5：
+    /// 说「记住…」→ 落库 → 问相关问题能检索到 → 说「忘记…」→ 再也检索不到 → 但行还在（审计）
+    #[test]
+    fn 端到端_记住之后能用_忘记之后不再用() {
+        use crate::core::memory::{
+            draft, parse_command, plan_write, retrieve, render_context, BigramRetriever, Command,
+            Retriever, WriteOutcome, TOP_K,
+        };
+        let db = Db::open_in_memory().unwrap();
+        let r = BigramRetriever;
+        let now = 1_760_000_000_000;
+
+        // 1. 用户说「记住…」
+        let Some(Command::Remember { content, kind, importance, ttl_ms }) =
+            parse_command("记住：我晚上上班，白天学习")
+        else {
+            panic!("没解析出记忆命令")
+        };
+        let cand = draft("m1".into(), content, kind, importance, 1.0,
+                         Source::UserExplicit, ttl_ms.map(|t| now + t), r.version(), now);
+        let WriteOutcome::Created { item } = plan_write(&db.all_memories().unwrap(), cand, &r, now)
+        else {
+            panic!("第一条应当是新增")
+        };
+        db.put_memory(&item).unwrap();
+
+        // 2. 问相关问题能检索到，且成文里有它
+        let hits = retrieve(&db.all_memories().unwrap(), "我白天学习该怎么安排", &r, now, TOP_K);
+        assert_eq!(hits.len(), 1, "记住了却检索不到");
+        db.touch_memories(&[hits[0].item.id.clone()], now).unwrap();
+        assert!(render_context(&hits).contains("白天学习"));
+
+        // 3. 闲聊不会再往库里加东西
+        assert!(parse_command("今天天气不错").is_none());
+        assert_eq!(db.all_memories().unwrap().len(), 1);
+
+        // 4. 用户说「忘记…」
+        let Some(Command::Forget { query }) = parse_command("忘记我晚上上班") else {
+            panic!("没解析出忘记命令")
+        };
+        let all = db.all_memories().unwrap();
+        let target = all
+            .iter()
+            .map(|m| (m, r.similarity(&query, &m.content)))
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .map(|(m, _)| m.id.clone())
+            .unwrap();
+        db.set_memory_status(&target, Status::Deleted, now).unwrap();
+
+        // 5. 再也进不了上下文，但行还在
+        let after = db.all_memories().unwrap();
+        assert_eq!(after.len(), 1, "软删除应当留下行当审计");
+        assert!(
+            retrieve(&after, "我白天学习该怎么安排", &r, now, TOP_K).is_empty(),
+            "删掉的记忆还在进上下文"
+        );
+        assert!(render_context(&retrieve(&after, "白天学习", &r, now, TOP_K)).is_empty());
+    }
 
     #[test]
     fn 迁移可以重复跑() {
