@@ -2,6 +2,7 @@
 //! （docs/03 §3）。LLM 只做理解和表达，计时和数值全是这里的确定性代码。
 
 pub mod actions;
+pub mod bias;
 pub mod db;
 pub mod food;
 pub mod obey;

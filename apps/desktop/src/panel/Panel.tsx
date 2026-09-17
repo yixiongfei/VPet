@@ -40,6 +40,15 @@ const mmss = (sec: number) => {
   return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`
 }
 
+interface BiasRow {
+  tag: string
+  weight: number
+  halfLife: number
+  age: number
+}
+
+const BIAS_LABEL: Record<string, string> = { work: '工作', study: '学习', play: '玩' }
+
 interface TimerRow {
   id: string
   label: string
@@ -64,6 +73,7 @@ export function Panel() {
   const [pomo, setPomo] = useState<Pomo | null>(null)
   const [audit, setAudit] = useState<AuditRow[]>([])
   const [verdict, setVerdict] = useState<Verdict | null>(null)
+  const [biases, setBiases] = useState<BiasRow[]>([])
 
   useEffect(() => {
     void invokeCore<string>('app_version').then((v) => v && setVersion(v))
@@ -72,6 +82,7 @@ export function Panel() {
       void invokeCore<TimerRow[]>('list_timers').then((t) => t && setTimers(t))
       void invokeCore<Pomo | null>('get_pomodoro').then(setPomo)
       void invokeCore<AuditRow[]>('recent_audit', { limit: 12 }).then((a) => a && setAudit(a))
+      void invokeCore<BiasRow[]>('list_biases').then((b) => b && setBiases(b))
     }
     pull()
     const timer = window.setInterval(pull, REFRESH_MS)
@@ -83,6 +94,10 @@ export function Panel() {
   }, [])
 
   const patch = (p: Record<string, number>) => void invokeCore('debug_patch_pet_state', p)
+  const bias = (tag: string, weight: number) =>
+    void invokeCore<BiasRow[]>('set_bias', { tag, weight }).then((b) => b && setBiases(b))
+  const unbias = (tag?: string) =>
+    void invokeCore<BiasRow[]>('clear_bias', { tag }).then((b) => b && setBiases(b))
   /** 使唤她一次。返回的是判定结果，不是「已执行」 */
   const askFor = (target: string) =>
     void invokeCore<Verdict | null>('request_action', { target }).then(setVerdict)
@@ -160,6 +175,48 @@ export function Panel() {
                   （这次有 {(verdict.p * 100).toFixed(0)}% 会听{verdict.refusal ? ` · ${verdict.refusal}` : ''}）
                 </span>
               </p>
+            )}
+          </Card>
+
+          <Card title="长期倾向">
+            <p style={{ margin: '0 0 12px', color: '#8a8a93', fontSize: 13 }}>
+              「多工作一点」是<strong>持续的倾向</strong>，不是一次性的命令。它只在她自己决策时加一份权重，
+              而且<strong>带半衰期</strong>（默认两小时）——随口一句话不该绑架她一辈子。
+              吃喝睡不在可调之列：那是生理，调不了。
+            </p>
+            <Row>
+              <Btn onClick={() => bias('work', 1)}>多工作</Btn>
+              <Btn onClick={() => bias('study', 1)}>多学习</Btn>
+              <Btn onClick={() => bias('play', -1)}>少玩点</Btn>
+              <Btn onClick={() => unbias()}>全撤</Btn>
+            </Row>
+            {biases.length === 0 ? (
+              <p style={{ margin: 0, color: '#8a8a93', fontSize: 13 }}>现在没有任何倾向</p>
+            ) : (
+              <ul style={{ listStyle: 'none', margin: 0, padding: 0 }}>
+                {biases.map((b) => (
+                  <li
+                    key={b.tag}
+                    style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 14, marginBottom: 6 }}
+                  >
+                    <span style={{ width: 44 }}>{BIAS_LABEL[b.tag] ?? b.tag}</span>
+                    <span
+                      style={{
+                        color: b.weight > 0 ? '#7cc47f' : '#e06c75',
+                        fontVariantNumeric: 'tabular-nums',
+                        width: 52,
+                      }}
+                    >
+                      {b.weight > 0 ? '+' : ''}
+                      {b.weight.toFixed(2)}
+                    </span>
+                    <span style={{ color: '#8a8a93', fontSize: 12 }}>
+                      半衰期 {b.halfLife.toFixed(0)}m · 已过 {b.age.toFixed(0)}m
+                    </span>
+                    <Btn onClick={() => unbias(b.tag)}>撤</Btn>
+                  </li>
+                ))}
+              </ul>
             )}
           </Card>
 

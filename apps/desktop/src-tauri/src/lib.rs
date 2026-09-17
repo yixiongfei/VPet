@@ -19,6 +19,7 @@ use core::tools::{
     builtin_tools, find as find_tool, summarize_input, AuditEntry, AuditLog, Decision, Origin,
     PermissionGate, ToolCall, ToolDef, ToolResult,
 };
+use core::bias::{BiasView, DEFAULT_HALF_LIFE};
 use core::obey::Verdict;
 use core::state_machine::{catch_up, reduce, Event, Pet, PetState, Touch};
 
@@ -347,6 +348,37 @@ fn roll() -> f32 {
     })
 }
 
+/// 用户的长期偏好：「多工作一点」「少玩会儿」。
+///
+/// 和 `request_action` 的区别是**持续 vs 一次性**：这条不挑具体做什么，
+/// 只在她自己决策时加一份倾向，而且带半衰期——你随口说的一句话不该绑架她一辈子。
+/// 它排不过生理急需，也排不过「到点该睡该吃」，那是状态机的结构保证的。
+#[tauri::command]
+fn set_bias(app: AppHandle, tag: String, weight: f32, half_life: Option<f32>) -> Vec<BiasView> {
+    apply(
+        &app,
+        &Event::SetBias {
+            tag,
+            weight,
+            half_life: half_life.unwrap_or(DEFAULT_HALF_LIFE),
+        },
+    );
+    list_biases(app)
+}
+
+/// 撤掉某条偏好；不给 tag 就全撤
+#[tauri::command]
+fn clear_bias(app: AppHandle, tag: Option<String>) -> Vec<BiasView> {
+    apply(&app, &Event::ClearBias(tag));
+    list_biases(app)
+}
+
+#[tauri::command]
+fn list_biases(app: AppHandle) -> Vec<BiasView> {
+    let pet = app.state::<Mutex<Pet>>();
+    pet.lock().map(|p| p.biases.list()).unwrap_or_default()
+}
+
 /// 唯一的工具入口（docs/03 §5）。
 ///
 /// 顺序是固定的：查工具 → 过权限门 → 执行 → 落审计。**审计一定要落**，
@@ -438,6 +470,24 @@ fn execute(app: &AppHandle, call: &ToolCall) -> ToolResult {
                 Some(v) => ToolResult::ok(id, serde_json::to_value(v).unwrap_or_default()),
                 None => ToolResult::err(id, "invalid_input", "判定没出结果"),
             }
+        }
+        "set_bias" => {
+            let Some(tag) = arg("target").or_else(|| arg("tag")) else {
+                return ToolResult::err(id, "invalid_input", "缺 tag");
+            };
+            let Some(weight) = call.input.get("weight").and_then(|v| v.as_f64()) else {
+                return ToolResult::err(id, "invalid_input", "缺 weight");
+            };
+            let half = call.input.get("halfLife").and_then(|v| v.as_f64()).map(|v| v as f32);
+            let list = set_bias(app.clone(), tag, weight as f32, half);
+            ToolResult::ok(id, serde_json::to_value(list).unwrap_or_default())
+        }
+        "clear_bias" => {
+            let list = clear_bias(app.clone(), arg("tag"));
+            ToolResult::ok(id, serde_json::to_value(list).unwrap_or_default())
+        }
+        "list_biases" => {
+            ToolResult::ok(id, serde_json::to_value(list_biases(app.clone())).unwrap_or_default())
         }
         "get_pet_state" => {
             let pet = app.state::<Mutex<Pet>>();
@@ -706,7 +756,10 @@ pub fn run() {
             list_tools,
             run_tool,
             recent_audit,
-            request_action
+            request_action,
+            set_bias,
+            clear_bias,
+            list_biases
         ])
         .build(tauri::generate_context!())
         .expect("VPet 启动失败")

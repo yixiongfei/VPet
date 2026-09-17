@@ -158,6 +158,7 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::bias::Biases;
     use crate::core::state_machine::{Activity, Mood, PetState};
 
     #[test]
@@ -222,11 +223,17 @@ mod tests {
             pressure: 1.0,
             touch_budget: 7.0,
             last_verdict: None,
+            biases: {
+                let mut b = Biases::default();
+                b.set("work", 1.0, 120.0);
+                b
+            },
         };
         db.record_pet_state(&p).unwrap();
         let back = db.latest_pet_state().unwrap().unwrap();
         assert_eq!(back.state, p.state);
         assert_eq!(back.cooldowns, p.cooldowns, "冷却也要跟着重启活下来");
+        assert_eq!(back.biases, p.biases, "用户偏好也要跟着重启活下来");
     }
 
     #[test]

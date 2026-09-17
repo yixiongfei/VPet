@@ -56,12 +56,12 @@ Phase 8  打磨与发布            ─  v4
 | 2.2 PetStateMachine | ✅ `reduce(state, event)` 纯函数 + 16 个单元测试；秒级 tick 推进体力/心情/饱腹/口渴；饿渴到阈值自动去吃喝。时间从外面以 `Event::Tick { minutes }` 喂进来，所以「四小时后会饿」能在测试里瞬间验证，离线补算也复用同一段代码。`Ill` 要「连续 3 天 PoorCondition」，需要在流水上做跨天统计，留给 Phase 7 的 Mood Engine |
 | 2.3 Scheduler | ✅ 一次性 / 周期；持久化在 `kv` 表；重启补发（过期的响一次，周期的下一次从现在起算）。**没用 tokio**——已有每秒一拍的心跳，再起一套调度只是多一个要对齐的时钟；到期判断做成纯函数，时间由外面喂。cron 等到真有按周/按月的需求再说 |
 | 2.4 Pomodoro Engine | ✅ 相位机（25/5，四个一轮转长休 15，节奏可配）；`pomodoro:tick` / `pomodoro:phase`。跑着时把宠物按在对应的事情上（专注→work、休息→rest），但生理急需压得过它——番茄钟不该把人饿死 |
-| 2.5 ToolRegistry + PermissionGate + AuditLog | ✅ `list_tools` / `run_tool` / `recent_audit`，固定走「查工具 → 过权限门 → 执行 → 落审计」。已建：`create_timer` `cancel_timer` `list_timers` `start_pomodoro` `stop_pomodoro` `get_pet_state` `request_action` `set_permission`。`set_setting` / `get_setting` 等 settings 真有人读时再加；`system_notify` 等系统通知那条路打通再加。`Ask` 的确认气泡是 Phase 3 的 UX，在那之前一律按拒绝处理 |
+| 2.5 ToolRegistry + PermissionGate + AuditLog | ✅ `list_tools` / `run_tool` / `recent_audit`，固定走「查工具 → 过权限门 → 执行 → 落审计」。已建：`create_timer` `cancel_timer` `list_timers` `start_pomodoro` `stop_pomodoro` `get_pet_state` `request_action` `set_bias` `clear_bias` `list_biases` `set_permission`。`set_setting` / `get_setting` 等 settings 真有人读时再加；`system_notify` 等系统通知那条路打通再加。`Ask` 的确认气泡是 Phase 3 的 UX，在那之前一律按拒绝处理 |
 | 2.6 Secrets | ⬜ 等 Phase 3 真的要用 API key 时再做——现在没有任何东西需要密钥，提前建一个空的密钥库只是摆设 |
 | 2.7 命令与事件面 | 🚧 已有 `pet:state` `pet:said` `pet:prompt` `timer:fired` `pomodoro:tick` `pomodoro:phase` `tool:confirm` `audit:appended`。`agent:trigger` 等 Phase 6 的 Observer；`build_context` / `session_append` / `memory_upsert` 等 Brain 和记忆到位 |
 | 2.8 服从与好感度 | ✅ 用户的要求不是命令，是一次概率判定。`affection`（好感度，天级慢变量）进 `PetState`；`obey::judge` 用对数几率模型算服从概率 `σ(基线 + 好感 + 心情 − 生理冲突 − 动作代价 − 压力)`；拒绝理由取冲突最大的那一项，一一对应固定台词。`request_action(target)` 是**唯一一处用户意志进入状态机的入口**，进来立刻降格成一次掷骰。被拒后反复施压会掉心情和好感 |
 | 2.9 自然语言控制 | ⬜ 把中文翻译成 `request_action` / `set_bias` 的调用。三层递进：① `intents.toml` 规则表 ② char-bigram 余弦近邻（穷人的 embedding，零依赖） ③ 本地 embedding 模型兜长尾（复用 Phase 4 的 `fastembed`，不另引依赖）。**NLU 只是工具层的前端**——Phase 3 的 LLM 调的是同一组工具 |
-| 2.10 偏好权重 Bias | ⬜ 「多工作一点」= 给 tag 加一个带半衰期的权重，作用于 `best()` 的打分，**不是**优先级阶梯上的新一级——所以翻不过「生理急需」那层，「她饿了就不听你的」由结构保证，不用另写规则 |
+| 2.10 偏好权重 Bias | ✅ 「多工作一点」= 给 tag 加一个带半衰期的权重（默认 120 分钟）。**不是**优先级阶梯上的新一级：它只在「作息」那层里重排 work/study/play 三条道、让正偏置越出时段，排不过「生理急需」，也排不过「到点该睡该吃」。吃喝睡不可压制（`SUPPRESSIBLE` 白名单）——「少吃点」不该把她饿死。`set_bias` / `clear_bias` / `list_biases` |
 
 **DoD**：不开 Brain，用 Panel 里的调试按钮调用 `run_tool("create_timer", {duration:"10s"})` → 10 秒后气泡出现、宠物动画切换、`audit` 表多一行；杀掉进程重启，未到期的计时器仍会触发。
 

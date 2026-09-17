@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::actions::{ActionDef, Catalog};
+use super::bias::{Biases, SPILL, SUPPRESS};
 use super::food::{FoodShelf, Need};
 use super::obey::{judge, Refusal, Verdict, PRESSURE_HURT};
 
@@ -145,6 +146,9 @@ pub struct Pet {
     /// 最近一次服从判定的结果。lib.rs 读它发气泡，不进 `PetState` 契约
     #[serde(default)]
     pub last_verdict: Option<Verdict>,
+    /// 用户的长期偏好：「多工作一点」「少玩会儿」。带半衰期，会自己淡掉
+    #[serde(default)]
+    pub biases: Biases,
 }
 
 fn default_touch_budget() -> f32 {
@@ -165,6 +169,7 @@ impl Default for Pet {
             pressure: 0.0,
             touch_budget: TOUCH_BUDGET_MAX,
             last_verdict: None,
+            biases: Biases::default(),
         }
     }
 }
@@ -188,6 +193,11 @@ pub enum Event {
     /// 用户要求她做某件事。`target` 是动作 id 或 tag，`roll` 是外部喂的 0–1 随机数。
     /// **不保证执行**——要过 `obey::judge`
     Request { target: String, roll: f32 },
+    /// 用户的长期偏好：正 = 多做，负 = 少做。`half_life` 是半衰期（分钟），
+    /// 给 0 用默认值。这不是命令，只改她自己决策时的倾向
+    SetBias { tag: String, weight: f32, half_life: f32 },
+    /// 撤掉某条偏好；`None` = 全撤
+    ClearBias(Option<String>),
     /// 调试用：直接改数值，用来验证阈值行为
     Patch {
         strength: Option<f32>,
@@ -219,6 +229,10 @@ pub(crate) const BROKE: f32 = 80.0;
    两条线合一是抖振的充要条件——心情 15 去玩，涨到 16 就被「上班时间」抢回去，
    掉回 15 又被抢走，两分钟翻一次。分开之后一个来回要几十分钟，
    看起来才像「歇够了再回去干活」。 --- */
+
+/// 只有这三类听用户的「多做点 / 少做点」。
+/// 吃喝睡不在里面——那是生理，用户关不掉，关掉就等于让她饿死
+pub(crate) const SUPPRESSIBLE: [&str; 3] = ["work", "study", "play"];
 
 /// 缓过这口气才算歇完
 const RECOVERED_FEELING: f32 = 35.0;
@@ -348,6 +362,13 @@ pub fn reduce(cat: &Catalog, shelf: &FoodShelf, p: &Pet, e: &Event) -> Pet {
             clamp(&mut n.state);
         }
         Event::Request { target, roll } => request(cat, shelf, &mut n, target, *roll),
+        Event::SetBias { tag, weight, half_life } => n.biases.set(tag, *weight, *half_life),
+        Event::ClearBias(tag) => match tag {
+            Some(t) => {
+                n.biases.clear(t);
+            }
+            None => n.biases.clear_all(),
+        },
         Event::Patch {
             strength,
             feeling,
@@ -392,6 +413,7 @@ fn tick(cat: &Catalog, shelf: &FoodShelf, n: &mut Pet, minutes: f32, hour: f32) 
     //     放在数值推进之前，这样同一拍里的请求判定用的是已经衰减过的压力
     n.state.affection += (AFFECTION_BASELINE - n.state.affection) * AFFECTION_REGRESS * minutes;
     n.pressure = (n.pressure - PRESSURE_DECAY * minutes).max(0.0);
+    n.biases.decay(minutes);
     n.touch_budget = (n.touch_budget + TOUCH_BUDGET_REGEN * minutes).min(TOUCH_BUDGET_MAX);
 
     // 2. 当前动作把数值往前推
@@ -466,7 +488,7 @@ fn tick(cat: &Catalog, shelf: &FoodShelf, n: &mut Pet, minutes: f32, hour: f32) 
     // 4. 过场动画不许打断；其余情况没事做或该换事做时重新决策
     let busy = n.state.activity.is_transient() && !done;
     if !busy && (n.state.action.is_none() || should_switch(cat, n, hour)) {
-        let chosen = decide_with_pin(cat, &n.state, &n.cooldowns, hour, n.pinned_tag.as_deref());
+        let chosen = decide_with_pin(cat, &n.state, &n.cooldowns, hour, n.pinned_tag.as_deref(), &n.biases);
         adopt(shelf, n, chosen);
     }
 }
@@ -501,6 +523,19 @@ fn should_switch(cat: &Catalog, n: &Pet, hour: f32) -> bool {
         }
     }
 
+    // 你刚说了少做这个，那就别接着做了。生理类不受此限——
+    // 「少吃点」不该让她饿死，这条在 decide 里由 SUPPRESSIBLE 白名单守着，
+    // 这里只认那三类
+    if SUPPRESSIBLE
+        .iter()
+        .any(|t| cur.has_tag(t) && n.biases.weight(t) <= SUPPRESS)
+    {
+        return true;
+    }
+    // 闲着发呆，而你说过想让她多做点什么——那就去做
+    if cur.duration <= 0.0 && !cur.is_scheduled() && n.biases.strongest().is_some() {
+        return true;
+    }
     // 排了时段的事，过了点就收手（下班了就别干了）
     if cur.is_scheduled() && !cur.fits_hour(hour) {
         return true;
@@ -519,7 +554,7 @@ pub fn decide<'a>(
     cd: &HashMap<String, f32>,
     hour: f32,
 ) -> (&'a ActionDef, &'static str) {
-    decide_with_pin(cat, s, cd, hour, None)
+    decide_with_pin(cat, s, cd, hour, None, &Biases::default())
 }
 
 /// 番茄钟跑着的时候，除了生理急需，其余一律听它的
@@ -529,6 +564,7 @@ pub fn decide_with_pin<'a>(
     cd: &HashMap<String, f32>,
     hour: f32,
     pinned: Option<&str>,
+    biases: &Biases,
 ) -> (&'a ActionDef, &'static str) {
     let ok = |a: &ActionDef| meets(a, s) && !cd.contains_key(&a.id);
     // 急需时连冷却都不管——真饿了不会因为「刚吃过」就饿着
@@ -563,16 +599,38 @@ pub fn decide_with_pin<'a>(
         }
     }
 
-    // 2. 作息：到点了就做该做的事，按「睡 > 吃 > 正事 > 玩」排
-    for (tag, why) in [
-        ("sleep", "到点睡觉"),
-        ("eat", "到饭点了"),
-        ("work", "上班时间"),
-        ("study", "该学习了"),
-        ("play", "该放松一下"),
-    ] {
+    // 2a. 到点该睡该吃。**用户偏好排不过这一层**——
+    //     「多工作一点」不等于「别睡觉也别吃饭」。这条是安全边界，别挪到下面去
+    for (tag, why) in [("sleep", "到点睡觉"), ("eat", "到饭点了")] {
         if let Some(a) = best(cat, tag, |a| a.is_scheduled() && a.fits_hour(hour) && ok(a)) {
             return (a, why);
+        }
+    }
+
+    // 2b. 正事和玩：这三类才听用户的。按偏好重排（稳定排序，没偏好时就是原来的顺序），
+    //     正偏置够大的还能越出自己的时段——「多工作」会让她晚上也想干活
+    let mut lanes = [
+        ("work", "上班时间", "你说要多工作"),
+        ("study", "该学习了", "你说要多学习"),
+        ("play", "该放松一下", "你说要多玩会儿"),
+    ];
+    lanes.sort_by(|x, y| {
+        biases
+            .weight(y.0)
+            .partial_cmp(&biases.weight(x.0))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for (tag, why, biased_why) in lanes {
+        let w = biases.weight(tag);
+        if w <= SUPPRESS {
+            continue; // 你说了少做这个
+        }
+        let spill = w >= SPILL;
+        if let Some(a) = best(cat, tag, |a| {
+            a.is_scheduled() && (spill || a.fits_hour(hour)) && ok(a)
+        }) {
+            let reason = if a.fits_hour(hour) { why } else { biased_why };
+            return (a, reason);
         }
     }
 
@@ -598,7 +656,15 @@ pub fn decide_with_pin<'a>(
         }
     }
 
-    // 4. 什么都不缺，发呆
+    // 4. 什么都不缺，但你说过想让她多做点什么。
+    //    放在需求之后——她自己的需要比你的偏好优先，这是「角色」不是「工具」
+    if let Some((tag, _)) = biases.strongest() {
+        if let Some(a) = best(cat, tag, ok) {
+            return (a, "你说要多做这个");
+        }
+    }
+
+    // 5. 什么都不缺，发呆
     (cat.fallback(), "没什么事")
 }
 
@@ -1362,6 +1428,122 @@ mod tests {
         }
         assert!(json.contains("\"idle\""));
         assert!(json.contains("\"nomal\""));
+    }
+
+    /* ---------- 用户偏好 Bias（roadmap 2.10） ---------- */
+
+    fn biased(cat: &Catalog, tag: &str, w: f32) -> Pet {
+        let mut p = Pet::default();
+        p = reduce(cat, &shelf(), &p, &Event::SetBias { tag: tag.into(), weight: w, half_life: 120.0 });
+        p
+    }
+
+    /// 某个钟点她会选什么
+    fn at(cat: &Catalog, p: &Pet, hour: f32) -> String {
+        let n = reduce(cat, &shelf(), p, &Event::Tick { minutes: 1.0, hour });
+        n.state.action.as_ref().map(|a| a.id.clone()).unwrap_or_default()
+    }
+
+    #[test]
+    fn 多学习会把学习排到工作前面() {
+        let c = cat();
+        let plain = Pet::default();
+        let keen = biased(&c, "study", 1.0);
+        // 上午既是上班时段也是学习时段，默认 work 先
+        assert!(c.get(&at(&c, &plain, 10.0)).unwrap().has_tag("work"));
+        assert!(c.get(&at(&c, &keen, 10.0)).unwrap().has_tag("study"), "说了多学习还在上班");
+    }
+
+    #[test]
+    fn 多工作会让她越出上班时段() {
+        let c = cat();
+        let keen = biased(&c, "work", 1.0);
+        let id = at(&c, &keen, 21.0); // 晚上九点，不是上班时段
+        let a = c.get(&id).unwrap();
+        assert!(a.has_tag("work"), "晚上九点她在 {}", a.name);
+        assert!(!a.fits_hour(21.0), "这条测的就是越界");
+    }
+
+    #[test]
+    fn 少玩点就真的不玩了() {
+        let c = cat();
+        let mut p = biased(&c, "play", -1.0);
+        p.state.feeling = 60.0; // 心情正常，不会走「心情崩了」那条急需通道
+        let id = at(&c, &p, 20.0); // 晚上八点本来是玩的时段
+        assert!(!c.get(&id).unwrap().has_tag("play"), "说了少玩还在 {id}");
+    }
+
+    /* --- 下面三条是安全边界：偏好排不过生理。别删 --- */
+
+    #[test]
+    fn 多工作也不会不睡觉() {
+        let c = cat();
+        let keen = biased(&c, "work", 2.0);
+        let id = at(&c, &keen, 1.0); // 凌晨一点
+        assert!(c.get(&id).unwrap().has_tag("sleep"), "凌晨一点她在 {id}");
+    }
+
+    #[test]
+    fn 多工作也不会不吃饭() {
+        let c = cat();
+        let keen = biased(&c, "work", 2.0);
+        let id = at(&c, &keen, 12.0); // 饭点
+        assert!(c.get(&id).unwrap().has_tag("eat"), "饭点她在 {id}");
+    }
+
+    #[test]
+    fn 饿垮了偏好一点用都没有() {
+        let c = cat();
+        let mut keen = biased(&c, "work", 2.0);
+        keen.state.hunger = 5.0;
+        let n = reduce(&c, &shelf(), &keen, &Event::Tick { minutes: 1.0, hour: 10.0 });
+        assert_eq!(n.state.activity, Activity::Eating);
+    }
+
+    #[test]
+    fn 偏好压不掉吃喝睡() {
+        let c = cat();
+        // 就算用户把 eat 的权重按到底，也不该影响「到饭点了」
+        let mut p = Pet::default();
+        p = reduce(&c, &shelf(), &p, &Event::SetBias { tag: "eat".into(), weight: -2.0, half_life: 120.0 });
+        let id = at(&c, &p, 12.0);
+        assert!(c.get(&id).unwrap().has_tag("eat"), "「少吃点」把她饿着了：{id}");
+    }
+
+    #[test]
+    fn 闲着的时候会去做你说的那件事() {
+        let c = cat();
+        let mut p = Pet::default();
+        // 凌晨四点本该睡觉，先让她醒着发呆：体力满、刚睡过、钱也够
+        p.cooldowns.insert("sleep".into(), 600.0);
+        p.state.money = BROKE * 2.0;
+        p = reduce(&c, &shelf(), &p, &Event::Tick { minutes: 1.0, hour: 4.0 });
+        let idle = p.state.action.as_ref().unwrap().id.clone();
+        assert_eq!(idle, c.fallback().id, "前提不成立，她在 {idle}");
+        p = reduce(&c, &shelf(), &p, &Event::SetBias { tag: "study".into(), weight: 1.0, half_life: 120.0 });
+        let id = at(&c, &p, 4.0);
+        assert!(c.get(&id).unwrap().has_tag("study"), "闲着也不去学：{id}");
+    }
+
+    #[test]
+    fn 偏好会自己淡掉() {
+        let c = cat();
+        let keen = biased(&c, "work", 1.0);
+        assert!((keen.biases.weight("work") - 1.0).abs() < 1e-6);
+        // 四个半衰期之后基本没了
+        let later = run(&c, keen, 480, 10.0);
+        assert!(later.biases.weight("work") < 0.1, "还剩 {}", later.biases.weight("work"));
+    }
+
+    #[test]
+    fn 撤掉偏好() {
+        let c = cat();
+        let mut p = biased(&c, "work", 1.0);
+        p = reduce(&c, &shelf(), &p, &Event::ClearBias(Some("work".into())));
+        assert_eq!(p.biases.weight("work"), 0.0);
+        p = biased(&c, "study", 1.0);
+        p = reduce(&c, &shelf(), &p, &Event::ClearBias(None));
+        assert!(p.biases.is_empty());
     }
 
     /* ---------- 迟滞：触发线和解除线分开 ---------- */

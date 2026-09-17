@@ -297,6 +297,33 @@ pub fn builtin_tools() -> Vec<ToolDef> {
             Level::Write,
         ),
         body(
+            "set_bias",
+            "调整她做某一类事的倾向。tag 只能是 work / study / play（吃喝睡是生理，调不了）。\
+             weight 正数 = 多做，负数 = 少做，范围 ±2。halfLife 是半衰期（分钟），不给按 120。\
+             这不是命令，只改她自己决策时的倾向——排不过生理急需，也排不过到点该睡该吃",
+            obj(
+                json!({
+                    "tag": { "type": "string", "enum": ["work", "study", "play"] },
+                    "weight": { "type": "number", "description": "正=多做，负=少做，±2" },
+                    "halfLife": { "type": "number", "description": "半衰期（分钟），默认 120" }
+                }),
+                &["tag", "weight"],
+            ),
+            Level::Write,
+        ),
+        body(
+            "clear_bias",
+            "撤掉某条倾向；不给 tag 就全撤",
+            obj(json!({ "tag": { "type": "string" } }), &[]),
+            Level::Write,
+        ),
+        body(
+            "list_biases",
+            "看看现在她身上有哪些倾向，各还剩多少权重",
+            obj(json!({}), &[]),
+            Level::Read,
+        ),
+        body(
             "get_pet_state",
             "看看她现在的状态：在做什么、体力心情饱腹口渴、钱和等级",
             obj(json!({}), &[]),
