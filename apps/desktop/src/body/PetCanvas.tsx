@@ -1,32 +1,49 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { AnimationPlayer } from './AnimationPlayer'
+import { Bubble } from './Bubble'
+import { ChatInput } from './ChatInput'
+import { subscribe } from './events'
 import { Interaction } from './interaction'
 import { loadManifest, loadProfile } from './manifest'
 import { subscribePetState } from './petState'
+import { cannedReply, hideDelayMs } from './say'
 import { toLogical } from './touch'
+
+interface BubbleState {
+  text: string
+  streaming: boolean
+}
 
 export function PetCanvas() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const interactionRef = useRef<Interaction | null>(null)
+  const sayGen = useRef(0)
+  const hideTimer = useRef(0)
   const [error, setError] = useState<string | null>(null)
   const [size, setSize] = useState(500)
+  const [name, setName] = useState('VPet')
+  const [bubble, setBubble] = useState<BubbleState | null>(null)
+  const [inputOpen, setInputOpen] = useState(false)
 
   useEffect(() => {
     const canvas = canvasRef.current
     if (!canvas) return
     let disposed = false
     let player: AnimationPlayer | null = null
-    let unsubscribe: (() => void) | null = null
+    const stops: Array<() => void> = []
 
     Promise.all([loadManifest(), loadProfile()])
       .then(([manifest, profile]) => {
         if (disposed) return
         setSize(manifest.size)
+        setName(profile.name)
         player = new AnimationPlayer(canvas, manifest)
         const interaction = new Interaction({ player, manifest, profile })
         interactionRef.current = interaction
         interaction.start()
-        unsubscribe = subscribePetState((s) => interaction.setState(s))
+        stops.push(subscribePetState((s) => interaction.setState(s)))
+        // Rust 侧全局快捷键按下时发这个事件（见 src-tauri/src/lib.rs）
+        stops.push(subscribe('pet:prompt', () => setInputOpen(true)))
         console.info(
           `[VPet] ${profile.name} 载入：${manifest.clips.length} clips · ${manifest.size}px · ${manifest.generatedAt}`,
         )
@@ -35,12 +52,51 @@ export function PetCanvas() {
 
     return () => {
       disposed = true
-      unsubscribe?.()
+      stops.forEach((f) => f())
+      window.clearTimeout(hideTimer.current)
       interactionRef.current?.dispose()
       interactionRef.current = null
       player?.destroy()
     }
   }, [])
+
+  const closeBubble = useCallback(() => {
+    sayGen.current++ // 作废进行中的流
+    window.clearTimeout(hideTimer.current)
+    setBubble(null)
+    interactionRef.current?.endSay()
+  }, [])
+
+  /** 流式把一段回话吐进气泡。Phase 3 把 cannedReply 换成 Brain 的 token 流即可 */
+  const say = useCallback(async (userText: string) => {
+    const gen = ++sayGen.current
+    window.clearTimeout(hideTimer.current)
+    interactionRef.current?.startSay()
+    setBubble({ text: '', streaming: true })
+    let acc = ''
+    for await (const chunk of cannedReply(userText)) {
+      if (gen !== sayGen.current) return
+      acc += chunk
+      setBubble({ text: acc, streaming: true })
+    }
+    if (gen !== sayGen.current) return
+    setBubble({ text: acc, streaming: false })
+    interactionRef.current?.endSay()
+    hideTimer.current = window.setTimeout(() => {
+      if (gen === sayGen.current) setBubble(null)
+    }, hideDelayMs(acc))
+  }, [])
+
+  // Esc：先收输入框，再收气泡
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      if (inputOpen) setInputOpen(false)
+      else if (bubble) closeBubble()
+    }
+    window.addEventListener('keydown', h)
+    return () => window.removeEventListener('keydown', h)
+  }, [inputOpen, bubble, closeBubble])
 
   const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (e.button !== 0) return
@@ -64,8 +120,23 @@ export function PetCanvas() {
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
       onPointerCancel={onPointerUp}
+      onDoubleClick={() => setInputOpen(true)}
     >
       <canvas ref={canvasRef} />
+
+      {(bubble || inputOpen) && (
+        <div
+          // 气泡在上、输入框在下，一起贴着窗口底部（docs/05 §4）
+          style={{ position: 'absolute', left: 8, right: 8, bottom: 8, display: 'flex', flexDirection: 'column', gap: 8 }}
+          // 别让点气泡/输入框的动作被宠物当成摸
+          onPointerDown={(e) => e.stopPropagation()}
+          onDoubleClick={(e) => e.stopPropagation()}
+        >
+          {bubble && <Bubble name={name} text={bubble.text} streaming={bubble.streaming} onClose={closeBubble} />}
+          {inputOpen && <ChatInput onSubmit={(t) => void say(t)} onCancel={() => setInputOpen(false)} />}
+        </div>
+      )}
+
       {error && (
         <div
           style={{

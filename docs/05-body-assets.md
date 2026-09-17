@@ -89,8 +89,10 @@ const CLIP_FOR: Record<Activity, { type: GraphType; name?: string }> = {
 
 - **穿透**：默认 `set_ignore_cursor_events(true)`；用 `pet.json` 的 touchhead/touchbody/pinch 区域 + 当前帧 alpha 判定鼠标是否"在宠物上"（Rust 侧每 50ms 读一次光标位置，命中就关掉穿透）。这是桌宠体验的核心细节。
 - **触摸**：摸头 → `touch_head` 三段式；摸身体 → `touch_body`；按住拖动 → `raise`（提起动态）+ 窗口跟随；放下 → 落地。
-- **气泡**：同一窗口内的 DOM 层（不另开窗口），位置由 `pet.json` 的 `say` 锚点决定；流式文本、最多 3 行，超出折叠为"展开"。
-- **输入**：全局快捷键（默认 `Alt+V` `🔶待确认`）或双击宠物 → 气泡下方出现输入框；Esc 收起。
+- **气泡**：同一窗口内的 DOM 层（不另开窗口），贴着窗口底部向上生长、盖在宠物身上——与原版 `MessageBar.xaml`（500×500 的层 + `VerticalAlignment=Bottom`）一致。流式文本、最多 3 行，超出折叠为"展开"。
+  > `vup.lps` 里**没有** `say` 锚点（顶层只有 pet/tag/touchhead/touchbody/touchraised/pinch/raisepoint/work/move/duration/bday/side），所以位置不走配置，按原版的底对齐规则来。
+  > 折叠不能用 `-webkit-line-clamp`：它在布局层就截断内容，`scrollHeight` 会等于 `clientHeight`，测不出溢出。用 `max-height` 裁。
+- **输入**：全局快捷键（默认 `Alt+V` `🔶待确认`，在 Rust 侧注册，不占 JS 的 ACL）或双击宠物 → 气泡下方出现输入框；Esc 先收输入框、再收气泡。
 - **托盘**：显示/隐藏、打开 Panel、退出。
 - **Panel 窗口**：普通窗口，React 路由 `/memory` `/permissions` `/audit` `/sessions`。
 

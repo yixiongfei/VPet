@@ -9,8 +9,12 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager, PhysicalPosition, WebviewWindow,
 };
+use tauri_plugin_global_shortcut::Shortcut;
 
 const PET_WINDOW: &str = "pet";
+
+/// 呼出输入框的全局快捷键（docs/05 §4 的默认值，Q 待确认）
+const PROMPT_SHORTCUT: &str = "Alt+V";
 
 #[tauri::command]
 fn app_version() -> &'static str {
@@ -29,11 +33,16 @@ pub fn run() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .setup(|app| {
             if let Some(win) = app.get_webview_window(PET_WINDOW) {
                 place_bottom_right(&win);
             }
             build_tray(app.handle())?;
+            if let Err(e) = register_prompt_shortcut(app.handle()) {
+                // 快捷键被别的程序占了不该拖垮启动，双击宠物一样能呼出输入框
+                log::warn!("注册全局快捷键 {PROMPT_SHORTCUT} 失败: {e}");
+            }
             log::info!("VPet {} 启动", env!("CARGO_PKG_VERSION"));
             Ok(())
         })
@@ -90,6 +99,25 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         builder = builder.icon(icon.clone());
     }
     builder.build(app)?;
+    Ok(())
+}
+
+/// 全局快捷键 → 把宠物窗口叫到前台并让 Body 弹出输入框。
+/// 窗口得先拿到焦点，否则输入框收不到键盘。
+fn register_prompt_shortcut(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+    use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+
+    let shortcut: Shortcut = PROMPT_SHORTCUT.parse()?;
+    app.global_shortcut().on_shortcut(shortcut, |app, _, event| {
+        if event.state() != ShortcutState::Pressed {
+            return;
+        }
+        if let Some(w) = app.get_webview_window(PET_WINDOW) {
+            let _ = w.show();
+            let _ = w.set_focus();
+        }
+        let _ = app.emit("pet:prompt", ());
+    })?;
     Ok(())
 }
 

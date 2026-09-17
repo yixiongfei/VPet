@@ -3,11 +3,16 @@
 ## 未发布 · Phase 1「Body MVP」进行中
 
 ### 新增
+- **气泡 + 输入框**（roadmap 1.4）：贴着窗口底部的 DOM 气泡，流式逐字输出、超过 3 行折叠为「展开」、× 或 Esc 收起、按字数自动收起（3–15s）。输入框在气泡下方，全局快捷键 `Alt+V`（Rust 侧注册，占用失败只 warn 不影响启动）或双击宠物呼出，Esc 收起。说话时循环播 `say` 动画，说完回到当前活动。Phase 1 还没有 Brain，回话是写死的，但链路按异步生成器 yield 片段的形状搭好了，Phase 3 换成 ModelProvider 的 token 流即可。
 - **状态 → 动画映射**（roadmap 1.6）：Body 订阅 Core 的 `pet:state`，按 `CLIP_FOR` 表切到该活动的循环动画（idle→default、working→workone、studying→study、break→idel、sleeping→sleep、playing→playone），心情同步换到对应心情的变体。载荷用 zod 校验，不合法只 warn 不崩。摸头/提起进行中收到新状态不打断，等交互结束自然切过去；非 idle 活动不再乱插空闲小动作。
 - **假状态源** `debug_set_pet_state`（Rust）：手动推一个 `pet:state` 给 Body，用来调映射；Phase 2 真状态机上线后删掉。浏览器预览里对应 `window.dispatchEvent(new CustomEvent('pet:state', { detail }))`。
 - **触摸交互**（roadmap 1.3）：移植原版 `Main.xaml.cs` 的鼠标语义——短按（< 500 ms）命中头/身体区域 → 摸头 / 摸身体；长按命中提起区 → 挣扎 ×3 → 静止循环，窗口跟住光标；松手 → 当前段播完落地回默认。判定用松手那一刻的光标位置，与原版一致。
 - **`pet.json` 契约** `packages/shared/src/profile.ts`：把 `vup.lps` 平铺的 `happy_px` / `nomal_px` … 收回成 `Record<Mood, Rect>`；触摸区域坐标统一在 500×500 逻辑参考系。
 - `AnimationPlayer.playStep()`：只播一个段落并回调，供外部状态机逐段编排（提起就是这么拼的）。
+
+### 修复
+- **提起会被 Tauri 的 ACL 拦下**：`capabilities/default.json` 只授了 `allow-start-dragging`，而提起改用 `setPosition` 跟随光标。补 `core:window:allow-set-position`，移掉不再用的 `allow-start-dragging`。
+- `docs/05` §4 写的「气泡位置由 pet.json 的 `say` 锚点决定」不成立——`vup.lps` 里没有这个键。按原版 `MessageBar` 的底对齐规则修正。
 
 ### 变更
 - 帧缓存从「最多 40 个 clip」改为 **192 MB 字节预算**。按 500×500 RGBA 估算，40 个 clip 最坏能到 ~400 MB，超出 Phase 1 DoD 的 300 MB 上限。

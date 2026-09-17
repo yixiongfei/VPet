@@ -30,8 +30,8 @@ export interface InteractionOpts {
  * 判定用的是松手/长按那一刻的光标位置，不是按下的位置（与原版一致）。
  */
 export class Interaction {
-  /** 交互模式，和 PetState.activity 是两回事：这个说「手正在干什么」 */
-  private mode: 'idle' | 'touching' | 'raised' = 'idle'
+  /** 交互模式，和 PetState.activity 是两回事：这个说「此刻正在干什么」 */
+  private mode: 'idle' | 'touching' | 'raised' | 'talking' = 'idle'
   private state: PetState = DEFAULT_PET_STATE
   private idleTimer = 0
   private pressTimer = 0
@@ -62,6 +62,23 @@ export class Interaction {
     const changed = s.activity !== this.state.activity || s.mood !== this.state.mood
     this.state = s
     if (changed && this.mode === 'idle') this.toActivity()
+  }
+
+  /**
+   * 说话期间循环播 say 动画。Phase 3 的 Think/Say 联动（roadmap 3.6）会在这之前
+   * 再插一段 think：请求发出 → think，首个 token → say。
+   */
+  startSay(): void {
+    if (this.disposed || this.mode === 'raised') return
+    this.mode = 'talking'
+    window.clearTimeout(this.idleTimer)
+    void this.o.player.play({ type: 'say', name: this.nameFor('say'), mood: this.state.mood })
+  }
+
+  /** 说完了，回到当前活动 */
+  endSay(): void {
+    if (this.disposed || this.mode !== 'talking') return
+    this.toActivity()
   }
 
   dispose(): void {
