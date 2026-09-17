@@ -87,7 +87,12 @@ const CLIP_FOR: Record<Activity, { type: GraphType; name?: string }> = {
   "skipTaskbar": true, "shadow": false, "resizable": false, "width": 500, "height": 500 }
 ```
 
-- **穿透**：默认 `set_ignore_cursor_events(true)`；用 `pet.json` 的 touchhead/touchbody/pinch 区域 + 当前帧 alpha 判定鼠标是否"在宠物上"（Rust 侧每 50ms 读一次光标位置，命中就关掉穿透）。这是桌宠体验的核心细节。
+- **穿透**：判定不走 touchhead/touchbody 那几个矩形（它们只覆盖头和身体，而 touchraised 是整幅 500 宽的一条带，拿来当命中区太粗），而是用**当前帧的 alpha**：
+  - Body 每画一帧，把 500×500 的帧缩到 **48×48**（≈10 逻辑像素/格）读回 alpha，按位打包成 288 字节，掩码变化时才 `set_hit_mask` 推给 Core。缩完再 readback 只有 ~9KB，比直接对原图 `getImageData`（1 MB）便宜两个数量级。
+  - Core 每 50 ms 读一次光标，换算成窗口内逻辑坐标查表，**只在结果变化时**才 `set_ignore_cursor_events`。
+  - **失败安全**：掩码还没到、光标/窗口位置读不到、状态锁被污染——一律退到「不穿透」。穿透错了宠物就再也点不着（只能从托盘退出），不穿透错了无非挡住下面一次点击，两种代价不对称。
+  - 交互期间（按下 / 提起）由 Body 调 `set_hit_test_pinned(true)` 钉住不穿透，否则把宠物拖到光标不再压着它的位置时，轮询会当场把拖拽切断。
+  - 托盘留了「鼠标穿透」开关，就是 07 风险表里那条退路的运行时版本。
 - **触摸**：摸头 → `touch_head` 三段式；摸身体 → `touch_body`；按住拖动 → `raise`（提起动态）+ 窗口跟随；放下 → 落地。
 - **气泡**：同一窗口内的 DOM 层（不另开窗口），贴着窗口底部向上生长、盖在宠物身上——与原版 `MessageBar.xaml`（500×500 的层 + `VerticalAlignment=Bottom`）一致。流式文本、最多 3 行，超出折叠为"展开"。
   > `vup.lps` 里**没有** `say` 锚点（顶层只有 pet/tag/touchhead/touchbody/touchraised/pinch/raisepoint/work/move/duration/bday/side），所以位置不走配置，按原版的底对齐规则来。

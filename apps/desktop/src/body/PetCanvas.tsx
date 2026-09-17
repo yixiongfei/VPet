@@ -3,9 +3,11 @@ import { AnimationPlayer } from './AnimationPlayer'
 import { Bubble } from './Bubble'
 import { ChatInput } from './ChatInput'
 import { subscribe } from './events'
+import { HitMask } from './hitMask'
 import { Interaction } from './interaction'
 import { loadManifest, loadProfile } from './manifest'
 import { subscribePetState } from './petState'
+import { pushHitMask } from './petWindow'
 import { cannedReply, hideDelayMs } from './say'
 import { toLogical } from './touch'
 
@@ -38,6 +40,12 @@ export function PetCanvas() {
         setSize(manifest.size)
         setName(profile.name)
         player = new AnimationPlayer(canvas, manifest)
+        // 每帧重算 alpha 掩码推给 Rust 的穿透判定（掩码没变就不推）
+        const mask = new HitMask()
+        player.onFrame = (bmp) => {
+          const changed = mask.update(bmp)
+          if (changed) void pushHitMask(changed)
+        }
         const interaction = new Interaction({ player, manifest, profile })
         interactionRef.current = interaction
         interaction.start()

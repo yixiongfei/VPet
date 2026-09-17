@@ -2,7 +2,7 @@ import type { GraphType, Manifest, PetProfile, PetState } from '@vpet/shared'
 import type { AnimationPlayer } from './AnimationPlayer'
 import { namesFor, pick } from './manifest'
 import { CLIP_FOR, DEFAULT_PET_STATE } from './petState'
-import { moveWindowBy } from './petWindow'
+import { moveWindowBy, setHitTestPinned } from './petWindow'
 import { clickZone, pressZone, type ClickZone } from './touch'
 
 /** 按住多久算长按（原版 Setting.PressLength，默认 0.5s） */
@@ -41,6 +41,7 @@ export class Interaction {
   private raiseName = 'raise'
   private followRaf = 0
   private pendingFollow: { dx: number; dy: number } | null = null
+  private pinned = false
   private disposed = false
 
   constructor(private readonly o: InteractionOpts) {}
@@ -87,11 +88,13 @@ export class Interaction {
     window.clearTimeout(this.pressTimer)
     cancelAnimationFrame(this.followRaf)
     this.o.player.onIdle = null
+    if (this.pinned) void setHitTestPinned(false)
   }
 
   onPointerDown(x: number, y: number): void {
     if (this.disposed || this.mode === 'raised') return
     this.lastAt = { x, y }
+    this.setPinned(true) // 按下期间别让穿透判定把窗口切走
     window.clearTimeout(this.idleTimer)
     window.clearTimeout(this.pressTimer)
     this.pressTimer = window.setTimeout(() => {
@@ -115,7 +118,7 @@ export class Interaction {
     this.pressTimer = 0
 
     if (this.mode === 'raised') {
-      this.released = true // 等当前段播完再落地
+      this.released = true // 等当前段播完再落地，落地后 toActivity 解钉
       return
     }
     if (!wasShortPress) return // 长按已经处理过了
@@ -123,14 +126,25 @@ export class Interaction {
     const at = this.lastAt
     const zone = at && clickZone(this.o.profile, at.x, at.y)
     if (zone) this.touch(zone)
-    else this.scheduleIdleAction() // 点在空白处：恢复空闲计时
+    else {
+      this.setPinned(false)
+      this.scheduleIdleAction() // 点在空白处：恢复空闲计时
+    }
   }
 
   /* ------------------------------------------------------------ */
 
+  /** 只在真的变化时打一次 IPC */
+  private setPinned(pinned: boolean): void {
+    if (this.pinned === pinned) return
+    this.pinned = pinned
+    void setHitTestPinned(pinned)
+  }
+
   /** 回到当前活动对应的循环动画 */
   private toActivity(): void {
     this.mode = 'idle'
+    this.setPinned(false)
     const { type, name } = CLIP_FOR[this.state.activity]
     void this.o.player.play({ type, name: this.nameFor(type, name), mood: this.state.mood })
     this.scheduleIdleAction()

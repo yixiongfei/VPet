@@ -42,6 +42,9 @@ export class AnimationPlayer {
   /** loop 段自然结束、且已被 stop() 后回调（end 段播完） */
   onIdle: (() => void) | null = null
 
+  /** 每画一帧回调一次，用来更新穿透判定的 alpha 掩码 */
+  onFrame: ((bmp: ImageBitmap) => void) | null = null
+
   constructor(
     canvas: HTMLCanvasElement,
     private readonly manifest: Manifest,
@@ -207,6 +210,7 @@ export class AnimationPlayer {
     const s = this.manifest.size
     this.ctx.clearRect(0, 0, s, s)
     this.ctx.drawImage(bmp, 0, 0, s, s)
+    this.onFrame?.(bmp)
   }
 
   private async decode(clip: GraphClip): Promise<ImageBitmap[]> {
