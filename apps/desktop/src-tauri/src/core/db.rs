@@ -211,6 +211,7 @@ mod tests {
                 money: 120.0,
                 exp: 900.0,
                 level: 3,
+                affection: 63.5,
                 action: None,
                 updated_at: 1_700_000_000_000,
             },
@@ -218,6 +219,9 @@ mod tests {
             earned: 5.0,
             cooldowns: [("work_copy".to_string(), 20.0)].into_iter().collect(),
             pinned_tag: None,
+            pressure: 1.0,
+            touch_budget: 7.0,
+            last_verdict: None,
         };
         db.record_pet_state(&p).unwrap();
         let back = db.latest_pet_state().unwrap().unwrap();

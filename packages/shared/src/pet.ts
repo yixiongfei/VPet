@@ -40,6 +40,11 @@ export const PetState = z.object({
   exp: z.number().min(0),
   /** 等级解锁更赚钱的活，也直接给收入加成 */
   level: z.number().int().min(0),
+  /**
+   * 好感度。**慢变量**——天级才看得出变化，和分钟级的 feeling 分属两个时间尺度。
+   * 决定她有多大概率听你的话：今天心情差可以不听，但关系好的话拒绝得更软
+   */
+  affection: z.number().min(0).max(100),
   action: ActionRef.nullish(),
   updatedAt: z.number().int(),
 })
@@ -52,3 +57,32 @@ export const MOOD_FALLBACK: Record<Mood, Mood[]> = {
   poorcondition: ['poorcondition', 'nomal', 'ill', 'happy'],
   ill: ['ill', 'poorcondition', 'nomal', 'happy'],
 }
+
+/** 她为什么不干。每一项对应一句固定台词，不需要生成模型 */
+export const Refusal = z.enum([
+  /** 做不到（等级/前置条件不够），不是不听话 */
+  'impossible',
+  /** 压根没有这件事可做 */
+  'unknown',
+  'hungry', 'thirsty', 'tired', 'sad',
+  /** 没有哪项特别突出，就是不太想 */
+  'reluctant',
+])
+export type Refusal = z.infer<typeof Refusal>
+
+/**
+ * Core → Body 的 `pet:said` 事件载荷：一次服从判定的结果。
+ *
+ * `p` 是这次服从的概率，一并带出来是为了能显示「刚才那次有 63% 会听」——
+ * 概率系统不给人看就成了玄学。
+ */
+export const Verdict = z.object({
+  obey: z.boolean(),
+  p: z.number().min(0).max(1),
+  /** 被要求的那件事 */
+  action: z.string(),
+  refusal: Refusal.nullish(),
+  /** 直接能显示在气泡里的一句话 */
+  say: z.string(),
+})
+export type Verdict = z.infer<typeof Verdict>

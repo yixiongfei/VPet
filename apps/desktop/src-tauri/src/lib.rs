@@ -19,6 +19,7 @@ use core::tools::{
     builtin_tools, find as find_tool, summarize_input, AuditEntry, AuditLog, Decision, Origin,
     PermissionGate, ToolCall, ToolDef, ToolResult,
 };
+use core::obey::Verdict;
 use core::state_machine::{catch_up, reduce, Event, Pet, PetState, Touch};
 
 use tauri::{
@@ -116,6 +117,7 @@ fn debug_patch_pet_state(
     hunger: Option<f32>,
     thirst: Option<f32>,
     money: Option<f32>,
+    affection: Option<f32>,
 ) {
     apply(
         &app,
@@ -125,6 +127,7 @@ fn debug_patch_pet_state(
             hunger,
             thirst,
             money,
+            affection,
         },
     );
 }
@@ -140,6 +143,17 @@ fn apply(app: &AppHandle, event: &Event) {
     next.state.updated_at = now_ms();
     *st = next.clone();
     drop(st);
+    // 服从判定的那一句话跟状态分开发：它是「她说的」，不是「她的数值」
+    if let Some(v) = next.last_verdict.as_ref() {
+        log::info!(
+            "「{}」→ {}（{:.0}% 会听）：{}",
+            v.action,
+            if v.obey { "好" } else { "不" },
+            v.p * 100.0,
+            v.say
+        );
+        let _ = app.emit("pet:said", v);
+    }
     let _ = app.emit("pet:state", next.state);
 }
 
@@ -302,6 +316,37 @@ fn recent_audit(audit: State<'_, Mutex<AuditLog>>, limit: Option<usize>) -> Vec<
         .unwrap_or_default()
 }
 
+/// 用户开口要她做某件事。`target` 是动作 id 或 tag（work / study / play / rest…）。
+///
+/// **不保证执行**：进状态机之后要过一次服从判定，成不成看她此刻的心情、身体状态
+/// 和对你的好感度。掷骰子在这里而不在状态机里——`reduce` 得保持纯函数。
+#[tauri::command]
+fn request_action(app: AppHandle, target: String) -> Option<Verdict> {
+    apply(&app, &Event::Request { target, roll: roll() });
+    let pet = app.state::<Mutex<Pet>>();
+    pet.lock().ok().and_then(|p| p.last_verdict.clone())
+}
+
+/// 0–1 的随机数。不拉 rand 依赖——一个 xorshift 够了，
+/// 而且这里要的只是「不可预测」，不是密码学强度
+fn roll() -> f32 {
+    use std::cell::Cell;
+    thread_local! {
+        static SEED: Cell<u64> = const { Cell::new(0) };
+    }
+    SEED.with(|s| {
+        let mut x = s.get();
+        if x == 0 {
+            x = now_ms() as u64 | 1;
+        }
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        s.set(x);
+        (x >> 40) as f32 / (1u32 << 24) as f32
+    })
+}
+
 /// 唯一的工具入口（docs/03 §5）。
 ///
 /// 顺序是固定的：查工具 → 过权限门 → 执行 → 落审计。**审计一定要落**，
@@ -385,6 +430,15 @@ fn execute(app: &AppHandle, call: &ToolCall) -> ToolResult {
             id,
             serde_json::json!({ "completed": stop_pomodoro(app.clone()) }),
         ),
+        "request_action" => {
+            let Some(target) = arg("target") else {
+                return ToolResult::err(id, "invalid_input", "缺 target");
+            };
+            match request_action(app.clone(), target) {
+                Some(v) => ToolResult::ok(id, serde_json::to_value(v).unwrap_or_default()),
+                None => ToolResult::err(id, "invalid_input", "判定没出结果"),
+            }
+        }
         "get_pet_state" => {
             let pet = app.state::<Mutex<Pet>>();
             let st = pet.lock().map(|p| p.state.clone()).unwrap_or_default();
@@ -651,7 +705,8 @@ pub fn run() {
             get_pomodoro,
             list_tools,
             run_tool,
-            recent_audit
+            recent_audit,
+            request_action
         ])
         .build(tauri::generate_context!())
         .expect("VPet 启动失败")

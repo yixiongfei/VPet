@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import type { PetState } from '@vpet/shared'
+import type { PetState, Verdict } from '@vpet/shared'
 import { invokeCore, IS_TAURI } from '../body/ipc'
 import { subscribePetState } from '../body/petState'
 import { Gauge } from './Gauge'
@@ -63,6 +63,7 @@ export function Panel() {
   const [timers, setTimers] = useState<TimerRow[]>([])
   const [pomo, setPomo] = useState<Pomo | null>(null)
   const [audit, setAudit] = useState<AuditRow[]>([])
+  const [verdict, setVerdict] = useState<Verdict | null>(null)
 
   useEffect(() => {
     void invokeCore<string>('app_version').then((v) => v && setVersion(v))
@@ -82,6 +83,9 @@ export function Panel() {
   }, [])
 
   const patch = (p: Record<string, number>) => void invokeCore('debug_patch_pet_state', p)
+  /** 使唤她一次。返回的是判定结果，不是「已执行」 */
+  const askFor = (target: string) =>
+    void invokeCore<Verdict | null>('request_action', { target }).then(setVerdict)
   const pullTimers = () => void invokeCore<TimerRow[]>('list_timers').then((t) => t && setTimers(t))
   const addTimer = (duration: string, label: string, repeat = false) =>
     void invokeCore('create_timer', { duration, label, repeat }).then(pullTimers)
@@ -129,11 +133,34 @@ export function Panel() {
             <Gauge label="心情" value={state.feeling} />
             <Gauge label="饱腹" value={state.hunger} />
             <Gauge label="口渴" value={state.thirst} />
+            <Gauge label="好感" value={state.affection} accent="#c98bdb" />
             <div style={{ display: 'flex', gap: 24, marginTop: 14, fontSize: 15 }}>
               <span>💰 {state.money.toFixed(1)}</span>
               <span>⭐ Lv{state.level}</span>
               <span style={{ color: '#8a8a93' }}>经验 {state.exp.toFixed(0)}</span>
             </div>
+          </Card>
+
+          <Card title="使唤她">
+            <p style={{ margin: '0 0 12px', color: '#8a8a93', fontSize: 13 }}>
+              她<strong>不一定答应</strong>。服从概率由基线 + 好感 + 心情 −
+              生理冲突 − 这件事本身的代价算出来，掷一次骰子决定。拒绝的理由来自冲突最大的那一项。
+            </p>
+            <Row>
+              <Btn onClick={() => askFor('work')}>去工作</Btn>
+              <Btn onClick={() => askFor('study')}>去学习</Btn>
+              <Btn onClick={() => askFor('play')}>去玩</Btn>
+              <Btn onClick={() => askFor('rest')}>去休息</Btn>
+              <Btn onClick={() => askFor('eat')}>去吃饭</Btn>
+            </Row>
+            {verdict && (
+              <p style={{ marginBottom: 0, color: verdict.obey ? '#7cc47f' : '#e0a458' }}>
+                {verdict.obey ? '✓' : '✗'}「{verdict.action}」· {verdict.say}
+                <span style={{ color: '#8a8a93', marginLeft: 8, fontVariantNumeric: 'tabular-nums' }}>
+                  （这次有 {(verdict.p * 100).toFixed(0)}% 会听{verdict.refusal ? ` · ${verdict.refusal}` : ''}）
+                </span>
+              </p>
+            )}
           </Card>
 
           <Card title="调试">
@@ -149,6 +176,8 @@ export function Panel() {
             <Row>
               <Btn onClick={() => patch({ money: 0 })}>钱清零</Btn>
               <Btn onClick={() => patch({ money: 5000 })}>给她 5000</Btn>
+              <Btn onClick={() => patch({ affection: 0 })}>好感清零</Btn>
+              <Btn onClick={() => patch({ affection: 100 })}>好感拉满</Btn>
               <Btn
                 onClick={() => void invokeCore<string>('give_gift').then((n) => setGift(n ?? '（没货架）'))}
               >
@@ -156,7 +185,7 @@ export function Panel() {
               </Btn>
               <Btn
                 onClick={() =>
-                  patch({ strength: 100, feeling: 60, hunger: 100, thirst: 100 })
+                  patch({ strength: 100, feeling: 60, hunger: 100, thirst: 100, affection: 50 })
                 }
               >
                 全部复原

@@ -285,6 +285,18 @@ pub fn builtin_tools() -> Vec<ToolDef> {
             Level::Write,
         ),
         body(
+            "request_action",
+            "请她去做某件事：target 写动作 id（work_copy）或大类 tag（work / study / play / rest / eat / drink）。\
+             她不一定答应——要看此刻的心情、身体状态和对你的好感度",
+            obj(
+                json!({
+                    "target": { "type": "string", "description": "动作 id 或 tag，如 work / rest" }
+                }),
+                &["target"],
+            ),
+            Level::Write,
+        ),
+        body(
             "get_pet_state",
             "看看她现在的状态：在做什么、体力心情饱腹口渴、钱和等级",
             obj(json!({}), &[]),

@@ -13,6 +13,7 @@ export const DEFAULT_PET_STATE: PetState = {
   money: 0,
   exp: 0,
   level: 0,
+  affection: 50,
   action: null,
   updatedAt: 0,
 }

@@ -1,3 +1,4 @@
+import { Verdict } from '@vpet/shared'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { AnimationPlayer } from './AnimationPlayer'
 import { Bubble } from './Bubble'
@@ -62,6 +63,13 @@ export function PetCanvas() {
           subscribe('timer:fired', (payload) => {
             const label = (payload as { label?: string } | null)?.label
             if (label) announce(`⏰ ${label}`)
+          }),
+        )
+        // 服从判定：你让她做事，她答应或者拒绝，都在气泡里回一句
+        stops.push(
+          subscribe('pet:said', (payload) => {
+            const v = Verdict.safeParse(payload)
+            if (v.success) announce(v.data.say)
           }),
         )
         console.info(

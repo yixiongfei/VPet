@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use super::actions::{ActionDef, Catalog};
 use super::food::{FoodShelf, Need};
+use super::obey::{judge, Refusal, Verdict, PRESSURE_HURT};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -86,8 +87,17 @@ pub struct PetState {
     pub money: f32,
     pub exp: f32,
     pub level: u32,
+    /// 好感度 0–100。**慢变量**：天级才看得出变化，和分钟级的 `feeling` 分属两个
+    /// 时间尺度——今天心情差可以不听你的，但长期关系好的话，她拒绝的方式会更软。
+    /// 50 是中性起点：她本来就是「女儿」，关系不从零开始
+    #[serde(default = "default_affection")]
+    pub affection: f32,
     pub action: Option<ActionRef>,
     pub updated_at: i64,
+}
+
+fn default_affection() -> f32 {
+    50.0
 }
 
 impl Default for PetState {
@@ -102,6 +112,7 @@ impl Default for PetState {
             money: 0.0,
             exp: 0.0,
             level: 0,
+            affection: default_affection(),
             action: None,
             updated_at: 0,
         }
@@ -110,7 +121,7 @@ impl Default for PetState {
 
 /// Core 内部的完整状态 = 发给 Body 的那部分 + 记账。
 /// 记账不进线上契约：Body 不需要知道「这一轮已经赚了多少」。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Pet {
     pub state: PetState,
@@ -123,6 +134,39 @@ pub struct Pet {
     /// 番茄钟把她按在某类事情上（专注 → work，休息 → rest）。
     /// 生理急需仍然能压过它——番茄钟不该把人饿死
     pub pinned_tag: Option<String>,
+    /// 被拒绝之后又被反复要求同一件事，攒下来的压力。随时间散掉。
+    /// 存在的理由：拒绝必须有分量，否则用户只要连点就能把概率刷穿
+    #[serde(default)]
+    pub pressure: f32,
+    /// 抚摸的额度（漏桶）。摸一下扣一点，随时间回。
+    /// 边际效用递减是真实的——狂点头不该等于爱
+    #[serde(default = "default_touch_budget")]
+    pub touch_budget: f32,
+    /// 最近一次服从判定的结果。lib.rs 读它发气泡，不进 `PetState` 契约
+    #[serde(default)]
+    pub last_verdict: Option<Verdict>,
+}
+
+fn default_touch_budget() -> f32 {
+    TOUCH_BUDGET_MAX
+}
+
+/// 手写而不是 `#[derive(Default)]`：`#[serde(default = "…")]` 只在**反序列化**时生效，
+/// `Pet::default()` 走不到它。derive 会让 `touch_budget` 落成 0——
+/// 新宠物一上来就「摸腻了」。同一个坑 `Requires::max_strength` 已经踩过一次
+impl Default for Pet {
+    fn default() -> Self {
+        Self {
+            state: PetState::default(),
+            elapsed: 0.0,
+            earned: 0.0,
+            cooldowns: HashMap::new(),
+            pinned_tag: None,
+            pressure: 0.0,
+            touch_budget: TOUCH_BUDGET_MAX,
+            last_verdict: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +185,9 @@ pub enum Event {
     Pin(Option<String>),
     /// 用户送了样东西。她自己不会凭空收到礼物，所以这条只能从外面来
     Gifted { id: String, name: String },
+    /// 用户要求她做某件事。`target` 是动作 id 或 tag，`roll` 是外部喂的 0–1 随机数。
+    /// **不保证执行**——要过 `obey::judge`
+    Request { target: String, roll: f32 },
     /// 调试用：直接改数值，用来验证阈值行为
     Patch {
         strength: Option<f32>,
@@ -148,28 +195,49 @@ pub enum Event {
         hunger: Option<f32>,
         thirst: Option<f32>,
         money: Option<f32>,
+        affection: Option<f32>,
     },
 }
 
 /* --- 仲裁用的阈值。这些是「策略」，不是「数据」，所以留在代码里 --- */
 
 /// 低到这个程度就压过作息：半夜也会爬起来吃
-const STARVING: f32 = 20.0;
-const PARCHED: f32 = 20.0;
-const EXHAUSTED: f32 = 15.0;
+pub(crate) const STARVING: f32 = 20.0;
+pub(crate) const PARCHED: f32 = 20.0;
+pub(crate) const EXHAUSTED: f32 = 15.0;
 /// 心情崩到这个程度，再忙也得歇一会儿——人不会把自己磨到彻底麻木还接着干
-const MISERABLE: f32 = 15.0;
+pub(crate) const MISERABLE: f32 = 15.0;
 /// 没到饭点但也该补一口了
-const HUNGRY: f32 = 35.0;
-const THIRSTY: f32 = 35.0;
+pub(crate) const HUNGRY: f32 = 35.0;
+pub(crate) const THIRSTY: f32 = 35.0;
 /// 心情低于此就想找点乐子
-const SAD: f32 = 40.0;
+pub(crate) const SAD: f32 = 40.0;
 /// 钱少于此就该去挣了
-const BROKE: f32 = 80.0;
+pub(crate) const BROKE: f32 = 80.0;
 
 const HAPPY_FEELING: f32 = 70.0;
 const NOMAL_FEELING: f32 = 40.0;
 const POOR_STRENGTH: f32 = 20.0;
+
+/* --- 好感度。慢变量，天级尺度 --- */
+
+/// 摸头一次涨多少好感（要有额度）
+const AFFECTION_HEAD: f32 = 0.15;
+const AFFECTION_BODY: f32 = 0.08;
+/// 她照做了，关系往前推一点
+const AFFECTION_OBEY: f32 = 0.3;
+/// 被逼急了掉多少
+const AFFECTION_PUSHED: f32 = 0.5;
+/// 抚摸额度上限与恢复速度（每分钟回多少）。摸 12 下就腻了，两小时回满
+const TOUCH_BUDGET_MAX: f32 = 12.0;
+const TOUCH_BUDGET_REGEN: f32 = 0.1;
+/// 好感度回归的基准线与速率。不是惩罚，是「久不联系会淡」——
+/// 指数回归，半衰期约七天（ln2 / (7×1440) ≈ 6.9e-5）
+const AFFECTION_BASELINE: f32 = 40.0;
+const AFFECTION_REGRESS: f32 = 6.9e-5;
+/// 压力每分钟散掉多少：被拒一次攒 1 点，半小时散完。
+/// 逼得越狠，缓过来越久——这是线性的，四次就是两小时
+const PRESSURE_DECAY: f32 = 1.0 / 30.0;
 
 const FEELING_HEAD: f32 = 1.0;
 const FEELING_BODY: f32 = 0.5;
@@ -215,9 +283,14 @@ pub fn earn_multiplier(s: &PetState) -> f32 {
 /// 状态机主体。不设置 `updated_at`——那是时钟，由调用方填
 pub fn reduce(cat: &Catalog, shelf: &FoodShelf, p: &Pet, e: &Event) -> Pet {
     let mut n = p.clone();
+    // 判定结果只在产生它的那一拍有效，否则 lib.rs 会把同一句话发一整天
+    n.last_verdict = None;
     match e {
         Event::Tick { minutes, hour } => tick(cat, shelf, &mut n, minutes.max(0.0), *hour),
         Event::Gifted { id, name } => {
+            // 送礼是实打实的心意，按价钱折好感度（贵的更管用，但有上限）
+            let price = shelf.get(id).map(|i| i.price).unwrap_or(0.0);
+            n.state.affection += (price / 200.0).clamp(0.3, 3.0);
             // 收礼不走 decide：礼物是别人给的，不是她自己挑的
             if let Some(a) = cat.get("gift") {
                 n.state.activity = a.activity;
@@ -252,14 +325,25 @@ pub fn reduce(cat: &Catalog, shelf: &FoodShelf, p: &Pet, e: &Event) -> Pet {
                 Touch::Raise => FEELING_RAISE,
             };
             n.state.strength -= STRENGTH_PER_TOUCH;
+            // 好感度只在额度内涨：连点一百下和好好摸十下，效果不该一样
+            if n.touch_budget >= 1.0 {
+                n.touch_budget -= 1.0;
+                n.state.affection += match t {
+                    Touch::Head => AFFECTION_HEAD,
+                    Touch::Body => AFFECTION_BODY,
+                    Touch::Raise => 0.0,
+                };
+            }
             clamp(&mut n.state);
         }
+        Event::Request { target, roll } => request(cat, shelf, &mut n, target, *roll),
         Event::Patch {
             strength,
             feeling,
             hunger,
             thirst,
             money,
+            affection,
         } => {
             if let Some(v) = strength {
                 n.state.strength = *v;
@@ -276,6 +360,9 @@ pub fn reduce(cat: &Catalog, shelf: &FoodShelf, p: &Pet, e: &Event) -> Pet {
             if let Some(v) = money {
                 n.state.money = *v;
             }
+            if let Some(v) = affection {
+                n.state.affection = *v;
+            }
             clamp(&mut n.state);
         }
     }
@@ -289,6 +376,12 @@ fn tick(cat: &Catalog, shelf: &FoodShelf, n: &mut Pet, minutes: f32, hour: f32) 
         *left -= minutes;
         *left > 0.0
     });
+
+    // 1.5 慢变量：好感度向基准线回归，压力散掉，抚摸额度回一点。
+    //     放在数值推进之前，这样同一拍里的请求判定用的是已经衰减过的压力
+    n.state.affection += (AFFECTION_BASELINE - n.state.affection) * AFFECTION_REGRESS * minutes;
+    n.pressure = (n.pressure - PRESSURE_DECAY * minutes).max(0.0);
+    n.touch_budget = (n.touch_budget + TOUCH_BUDGET_REGEN * minutes).min(TOUCH_BUDGET_MAX);
 
     // 2. 当前动作把数值往前推
     let current = n
@@ -487,7 +580,7 @@ pub fn decide_with_pin<'a>(
 
 /// 同一标签里挑「最好」的一个：优先级看收益，收益一样看等级门槛高的
 /// （门槛高的通常更强，能做就做）
-fn best<'a>(
+pub(crate) fn best<'a>(
     cat: &'a Catalog,
     tag: &str,
     pred: impl Fn(&ActionDef) -> bool,
@@ -501,13 +594,50 @@ fn best<'a>(
         })
 }
 
-fn meets(a: &ActionDef, s: &PetState) -> bool {
+pub(crate) fn meets(a: &ActionDef, s: &PetState) -> bool {
     let r = a.requires;
     s.level >= r.level
         && s.strength >= r.min_strength
         && s.hunger >= r.min_hunger
         && s.thirst >= r.min_thirst
         && s.strength <= r.max_strength
+}
+
+/// 用户开口要她做某件事。`target` 可以是动作 id（`work_copy`），
+/// 也可以是 tag（`work` / `rest` / `study`）——tag 走和 `decide` 同一套挑选逻辑，
+/// 所以「去工作」和她自己决定去工作，挑中的是同一件活。
+///
+/// **这里是唯一一处「用户意志」进入状态机的入口**，而它进来之后立刻被降格成一次
+/// 概率判定：用户不能直接写 `state.activity`。
+fn request(cat: &Catalog, shelf: &FoodShelf, n: &mut Pet, target: &str, roll: f32) {
+    let picked = cat
+        .get(target)
+        .or_else(|| best(cat, target, |a| meets(a, &n.state)))
+        // 一件都不满足条件时也要挑一个出来，好让 judge 回一句「我做不来」，
+        // 而不是含糊的「这个我不会」
+        .or_else(|| best(cat, target, |_| true));
+    let Some(a) = picked else {
+        n.last_verdict = Some(Verdict::refused(target, Refusal::Unknown, 0.0));
+        return;
+    };
+
+    let v = judge(a, &n.state, n.pressure, roll);
+    if v.obey {
+        n.pressure = 0.0;
+        n.state.affection += AFFECTION_OBEY;
+        // 你开口了就别让冷却卡着：冷却是「她自己不会连着做」，不是「不能做」
+        n.cooldowns.remove(&a.id);
+        adopt(shelf, n, (a, "你让我做的"));
+    } else {
+        // 第一次拒绝不收费。拒了还接着逼，才开始伤心情和好感
+        if n.pressure >= PRESSURE_HURT {
+            n.state.feeling -= 2.0;
+            n.state.affection -= AFFECTION_PUSHED;
+        }
+        n.pressure += 1.0;
+    }
+    clamp(&mut n.state);
+    n.last_verdict = Some(v);
 }
 
 fn adopt(shelf: &FoodShelf, n: &mut Pet, (a, reason): (&ActionDef, &'static str)) {
@@ -592,6 +722,7 @@ fn clamp(s: &mut PetState) {
         &mut s.feeling,
         &mut s.hunger,
         &mut s.thirst,
+        &mut s.affection,
     ] {
         *v = v.clamp(0.0, 100.0);
     }
@@ -1207,6 +1338,172 @@ mod tests {
         }
         assert!(json.contains("\"idle\""));
         assert!(json.contains("\"nomal\""));
+    }
+
+    /* ---------- 好感度与服从（roadmap 2.8） ---------- */
+
+    fn ask(cat: &Catalog, p: &Pet, target: &str, roll: f32) -> Pet {
+        reduce(cat, &shelf(), p, &Event::Request { target: target.into(), roll })
+    }
+
+    #[test]
+    fn 请求可以用_tag_也可以用动作_id() {
+        let c = cat();
+        let mut p = Pet::default();
+        p.state.feeling = 90.0;
+        let by_tag = ask(&c, &p, "work", 0.0);
+        let by_id = ask(&c, &p, "work_copy", 0.0);
+        assert_eq!(by_tag.state.activity, Activity::Working);
+        assert_eq!(by_id.state.action.as_ref().unwrap().id, "work_copy");
+    }
+
+    #[test]
+    fn 她照做的时候_reason_说明是你让的() {
+        let c = cat();
+        let mut p = Pet::default();
+        p.state.feeling = 95.0;
+        let n = ask(&c, &p, "rest", 0.0);
+        assert_eq!(n.state.action.as_ref().unwrap().reason, "你让我做的");
+        assert!(n.last_verdict.as_ref().unwrap().obey);
+    }
+
+    #[test]
+    fn 她拒绝的时候什么都不变() {
+        let c = cat();
+        let mut p = Pet::default();
+        p.state.hunger = 30.0; // 有点饿，但还够得着 work 的门槛
+        let before = p.state.clone();
+        let n = ask(&c, &p, "work", 1.0);
+        let v = n.last_verdict.as_ref().unwrap();
+        assert!(!v.obey);
+        assert_eq!(n.state.activity, before.activity, "拒绝不该改变她在做的事");
+        assert!(!v.say.is_empty(), "拒绝要有话说");
+    }
+
+    #[test]
+    fn 判定结果只活一拍() {
+        let c = cat();
+        let mut p = Pet::default();
+        p.state.feeling = 95.0;
+        let n = ask(&c, &p, "rest", 0.0);
+        assert!(n.last_verdict.is_some());
+        let later = reduce(&c, &shelf(), &n, &Event::Tick { minutes: 1.0, hour: 10.0 });
+        assert!(later.last_verdict.is_none(), "不清掉的话同一句话会发一整天");
+    }
+
+    #[test]
+    fn 用户开口能越过冷却() {
+        let c = cat();
+        let mut p = Pet::default();
+        p.state.feeling = 95.0;
+        p.cooldowns.insert("work_copy".into(), 30.0);
+        let n = ask(&c, &p, "work_copy", 0.0);
+        assert!(n.state.action.as_ref().is_some_and(|a| a.id == "work_copy"));
+        assert!(!n.cooldowns.contains_key("work_copy"));
+    }
+
+    #[test]
+    fn 反复逼她会掉好感和心情() {
+        let c = cat();
+        let mut p = Pet::default();
+        p.state.hunger = 25.0;
+        let aff0 = p.state.affection;
+        // 连着要求四次，每次都掷出必拒
+        for _ in 0..4 {
+            p = ask(&c, &p, "work", 1.0);
+        }
+        assert!(p.state.affection < aff0, "被逼了四次好感还没掉");
+        assert!(p.pressure >= 3.0);
+        // 压力会自己散：一次要半小时，逼了四次就得两小时
+        assert!(run(&c, p.clone(), 40, 10.0).pressure > 0.0, "才 40 分钟不该全消");
+        assert_eq!(run(&c, p.clone(), 130, 10.0).pressure, 0.0);
+    }
+
+    #[test]
+    fn 第一次拒绝不收费() {
+        let c = cat();
+        let mut p = Pet::default();
+        p.state.hunger = 25.0;
+        let aff0 = p.state.affection;
+        let n = ask(&c, &p, "work", 1.0);
+        assert!(!n.last_verdict.as_ref().unwrap().obey);
+        assert_eq!(n.state.affection, aff0, "拒绝一次不该有代价——那是她的权利");
+    }
+
+    #[test]
+    fn 摸头涨好感但有额度() {
+        let c = cat();
+        let mut p = Pet::default();
+        let aff0 = p.state.affection;
+        for _ in 0..100 {
+            p = reduce(&c, &shelf(), &p, &Event::Touched(Touch::Head));
+        }
+        let gained = p.state.affection - aff0;
+        assert!(gained > 0.0);
+        assert!(gained <= 12.0 * AFFECTION_HEAD + 1e-3, "连点一百下涨了 {gained}");
+        assert_eq!(p.touch_budget, 0.0);
+    }
+
+    #[test]
+    fn 抚摸额度会随时间回来() {
+        let c = cat();
+        let mut p = Pet::default();
+        for _ in 0..20 {
+            p = reduce(&c, &shelf(), &p, &Event::Touched(Touch::Head));
+        }
+        assert_eq!(p.touch_budget, 0.0);
+        let later = run(&c, p, 60, 10.0);
+        assert!(later.touch_budget > 5.0, "一小时后还是 {}", later.touch_budget);
+    }
+
+    #[test]
+    fn 送礼涨好感() {
+        let c = cat();
+        let sh = stocked();
+        let p = Pet::default();
+        let n = reduce(&c, &sh, &p, &Event::Gifted { id: "cake".into(), name: "蛋糕".into() });
+        assert!(n.state.affection > p.state.affection);
+    }
+
+    #[test]
+    fn 好感度长期向基准线回归() {
+        let c = cat();
+        let mut p = Pet::default();
+        p.state.affection = 100.0;
+        // 七天不互动（只走时间），应当掉到 (100+40)/2 = 70 附近
+        let later = run(&c, p, 0, 10.0);
+        let mut q = later;
+        for _ in 0..(7 * 24) {
+            q = reduce(&c, &shelf(), &q, &Event::Tick { minutes: 60.0, hour: 10.0 });
+        }
+        assert!((q.state.affection - 70.0).abs() < 3.0, "七天后 {}", q.state.affection);
+        assert!(q.state.affection > AFFECTION_BASELINE, "回归不是清零");
+    }
+
+    #[test]
+    fn 好感度不会越界() {
+        let c = cat();
+        let mut p = Pet::default();
+        p.state.affection = 99.9;
+        for _ in 0..50 {
+            p = reduce(&c, &shelf(), &p, &Event::Touched(Touch::Head));
+        }
+        assert!(p.state.affection <= 100.0);
+    }
+
+    #[test]
+    fn 不认识的事她会说不会() {
+        let c = cat();
+        let p = Pet::default();
+        let n = ask(&c, &p, "开飞机", 0.0);
+        assert_eq!(n.last_verdict.as_ref().unwrap().refusal, Some(Refusal::Unknown));
+    }
+
+    #[test]
+    fn 新宠物的抚摸额度是满的() {
+        // Pet::default() 走的是手写 impl，不是 derive——serde default 管不到它
+        assert_eq!(Pet::default().touch_budget, TOUCH_BUDGET_MAX);
+        assert_eq!(Pet::default().state.affection, 50.0);
     }
 }
 
