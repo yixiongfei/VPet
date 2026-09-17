@@ -15,6 +15,10 @@ use core::db::Db;
 use core::food::{FoodItem, FoodShelf};
 use core::pomodoro::{Phase, Pomodoro, Tick as PomoTick};
 use core::scheduler::{parse_duration, Scheduler, Timer};
+use core::tools::{
+    builtin_tools, find as find_tool, summarize_input, AuditEntry, AuditLog, Decision, Origin,
+    PermissionGate, ToolCall, ToolDef, ToolResult,
+};
 use core::state_machine::{catch_up, reduce, Event, Pet, PetState, Touch};
 
 use tauri::{
@@ -283,6 +287,130 @@ fn restore_state(app: &AppHandle, cat: &Catalog, shelf: &FoodShelf) -> Pet {
     restored
 }
 
+/// Brain 能用的全部工具。`executor` 不在这张表里——LLM 不需要知道怎么执行
+#[tauri::command]
+fn list_tools() -> Vec<ToolDef> {
+    builtin_tools()
+}
+
+/// 最近的审计。Panel 用来看她都做了什么
+#[tauri::command]
+fn recent_audit(audit: State<'_, Mutex<AuditLog>>, limit: Option<usize>) -> Vec<AuditEntry> {
+    audit
+        .lock()
+        .map(|a| a.recent(limit.unwrap_or(50)))
+        .unwrap_or_default()
+}
+
+/// 唯一的工具入口（docs/03 §5）。
+///
+/// 顺序是固定的：查工具 → 过权限门 → 执行 → 落审计。**审计一定要落**，
+/// 哪怕被拒绝了——「她想做但没让做」和「她做了」一样重要。
+#[tauri::command]
+fn run_tool(app: AppHandle, call: ToolCall) -> ToolResult {
+    let tools = builtin_tools();
+    let Some(def) = find_tool(&tools, &call.name) else {
+        return ToolResult::err(&call.call_id, "unknown_tool", format!("没有这个工具：{}", call.name));
+    };
+
+    let decision = {
+        let gate = app.state::<Mutex<PermissionGate>>();
+        let Ok(g) = gate.lock() else {
+            return ToolResult::err(&call.call_id, "denied", "权限表被污染");
+        };
+        g.check(def, call.origin)
+    };
+
+    let result = match decision {
+        Decision::Deny => ToolResult::err(&call.call_id, "denied", "这件事没有授权"),
+        // Ask 的确认气泡是 Phase 3 的 UX（docs/03 §6）。在那之前一律当拒绝处理，
+        // 宁可少做也不要在用户没点头的情况下动手
+        Decision::Ask => {
+            let _ = app.emit("tool:confirm", &call.name);
+            ToolResult::err(&call.call_id, "denied", "需要你点头（确认气泡在 Phase 3）")
+        }
+        Decision::Allow => execute(&app, &call),
+    };
+
+    let audit = app.state::<Mutex<AuditLog>>();
+    if let Ok(mut a) = audit.lock() {
+        let entry = AuditEntry {
+            at: now_ms(),
+            tool: call.name.clone(),
+            origin: call.origin,
+            decision,
+            ok: result.ok,
+            input: summarize_input(&call.input),
+            summary: match (&result.data, &result.error) {
+                (Some(d), _) => summarize_input(d),
+                (_, Some(e)) => e.message.clone(),
+                _ => String::new(),
+            },
+        };
+        let _ = app.emit("audit:appended", &entry);
+        a.record(entry);
+    }
+    result
+}
+
+/// 工具的真正执行。放这里是因为只有这儿够得着 app state
+fn execute(app: &AppHandle, call: &ToolCall) -> ToolResult {
+    let id = &call.call_id;
+    let arg = |k: &str| call.input.get(k).and_then(|v| v.as_str()).map(String::from);
+    match call.name.as_str() {
+        "create_timer" => {
+            let Some(duration) = arg("duration") else {
+                return ToolResult::err(id, "invalid_input", "缺 duration");
+            };
+            let repeat = call.input.get("repeat").and_then(|v| v.as_bool());
+            match create_timer(app.clone(), duration, arg("label"), repeat) {
+                Ok(t) => ToolResult::ok(id, serde_json::to_value(t).unwrap_or_default()),
+                Err(e) => ToolResult::err(id, "invalid_input", e),
+            }
+        }
+        "cancel_timer" => match arg("id") {
+            Some(tid) => ToolResult::ok(id, serde_json::json!({ "cancelled": cancel_timer(app.clone(), tid) })),
+            None => ToolResult::err(id, "invalid_input", "缺 id"),
+        },
+        "list_timers" => {
+            let sched = app.state::<Mutex<Scheduler>>();
+            let list = sched.lock().map(|s| s.list().to_vec()).unwrap_or_default();
+            ToolResult::ok(id, serde_json::to_value(list).unwrap_or_default())
+        }
+        "start_pomodoro" => ToolResult::ok(
+            id,
+            serde_json::to_value(start_pomodoro(app.clone())).unwrap_or_default(),
+        ),
+        "stop_pomodoro" => ToolResult::ok(
+            id,
+            serde_json::json!({ "completed": stop_pomodoro(app.clone()) }),
+        ),
+        "get_pet_state" => {
+            let pet = app.state::<Mutex<Pet>>();
+            let st = pet.lock().map(|p| p.state.clone()).unwrap_or_default();
+            ToolResult::ok(id, serde_json::to_value(st).unwrap_or_default())
+        }
+        "set_permission" => {
+            let (Some(scope), Some(d)) = (arg("scope"), arg("decision")) else {
+                return ToolResult::err(id, "invalid_input", "缺 scope 或 decision");
+            };
+            let decision = match d.as_str() {
+                "allow" => Decision::Allow,
+                "ask" => Decision::Ask,
+                "deny" => Decision::Deny,
+                other => return ToolResult::err(id, "invalid_input", format!("看不懂的决定：{other}")),
+            };
+            let gate = app.state::<Mutex<PermissionGate>>();
+            if let Ok(mut g) = gate.lock() {
+                g.set(&scope, decision);
+                log::info!("授权变更：{scope} → {d}");
+            }
+            ToolResult::ok(id, serde_json::json!({ "scope": scope, "decision": d }))
+        }
+        other => ToolResult::err(id, "unknown_tool", format!("没有这个工具：{other}")),
+    }
+}
+
 /// 开始番茄钟。已经在跑就返回当前进度，不会把它清零
 #[tauri::command]
 fn start_pomodoro(app: AppHandle) -> Option<PomoTick> {
@@ -490,6 +618,8 @@ pub fn run() {
             }
             app.manage(Mutex::new(timers));
             app.manage(Mutex::new(Pomodoro::default()));
+            app.manage(Mutex::new(PermissionGate::default()));
+            app.manage(Mutex::new(AuditLog::default()));
             app.manage(Mutex::new(restored));
             if let Some(win) = app.get_webview_window(PET_WINDOW) {
                 place_bottom_right(&win);
@@ -518,7 +648,10 @@ pub fn run() {
             list_timers,
             start_pomodoro,
             stop_pomodoro,
-            get_pomodoro
+            get_pomodoro,
+            list_tools,
+            run_tool,
+            recent_audit
         ])
         .build(tauri::generate_context!())
         .expect("VPet 启动失败")

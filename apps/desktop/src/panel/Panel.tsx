@@ -7,6 +7,22 @@ import { Gauge } from './Gauge'
 /** 面板刷新节奏。Core 只在换动作时推事件，数值得自己拉 */
 const REFRESH_MS = 1000
 
+interface AuditRow {
+  at: number
+  tool: string
+  origin: string
+  decision: 'allow' | 'ask' | 'deny'
+  ok: boolean
+  input: string
+  summary: string
+}
+
+const DECISION_COLOR: Record<AuditRow['decision'], string> = {
+  allow: '#7cc47f',
+  ask: '#e0a458',
+  deny: '#e06c75',
+}
+
 interface Pomo {
   phase: 'focus' | 'shortbreak' | 'longbreak'
   remainingSec: number
@@ -46,6 +62,7 @@ export function Panel() {
   const [gift, setGift] = useState<string | null>(null)
   const [timers, setTimers] = useState<TimerRow[]>([])
   const [pomo, setPomo] = useState<Pomo | null>(null)
+  const [audit, setAudit] = useState<AuditRow[]>([])
 
   useEffect(() => {
     void invokeCore<string>('app_version').then((v) => v && setVersion(v))
@@ -53,6 +70,7 @@ export function Panel() {
       void invokeCore<PetState>('get_pet_state').then((s) => s && setState(s))
       void invokeCore<TimerRow[]>('list_timers').then((t) => t && setTimers(t))
       void invokeCore<Pomo | null>('get_pomodoro').then(setPomo)
+      void invokeCore<AuditRow[]>('recent_audit', { limit: 12 }).then((a) => a && setAudit(a))
     }
     pull()
     const timer = window.setInterval(pull, REFRESH_MS)
@@ -67,6 +85,13 @@ export function Panel() {
   const pullTimers = () => void invokeCore<TimerRow[]>('list_timers').then((t) => t && setTimers(t))
   const addTimer = (duration: string, label: string, repeat = false) =>
     void invokeCore('create_timer', { duration, label, repeat }).then(pullTimers)
+  const callTool = (name: string, input: Record<string, unknown>) =>
+    void invokeCore('run_tool', {
+      call: { callId: `panel-${Date.now()}`, name, input, origin: 'user' },
+    }).then(() => {
+      pullTimers()
+      void invokeCore<AuditRow[]>('recent_audit', { limit: 12 }).then((a) => a && setAudit(a))
+    })
 
   return (
     <div style={{ maxWidth: 720, margin: '0 auto', padding: '24px 20px 40px' }}>
@@ -138,6 +163,42 @@ export function Panel() {
               </Btn>
             </Row>
             {gift && <p style={{ color: '#a8d5a2', marginBottom: 0 }}>送出了：{gift}</p>}
+          </Card>
+
+          <Card title="工具调用">
+            <p style={{ margin: '0 0 12px', color: '#8a8a93', fontSize: 13 }}>
+              Brain 只能通过这条路动这个系统：过权限门 → 执行 → 落审计。下面的按钮走的是同一条路。
+            </p>
+            <Row>
+              <Btn onClick={() => callTool('create_timer', { duration: '10s', label: '十秒到了' })}>
+                run_tool(create_timer 10s)
+              </Btn>
+              <Btn onClick={() => callTool('get_pet_state', {})}>run_tool(get_pet_state)</Btn>
+              <Btn onClick={() => callTool('set_permission', { scope: 'kb.read', decision: 'allow' })}>
+                run_tool(set_permission) · 会被拦
+              </Btn>
+            </Row>
+            {audit.length === 0 ? (
+              <p style={{ color: '#8a8a93', margin: 0, fontSize: 13 }}>还没有调用记录</p>
+            ) : (
+              <ul style={{ listStyle: 'none', padding: 0, margin: 0, fontSize: 13 }}>
+                {audit.map((a, i) => (
+                  <li
+                    key={`${a.at}-${i}`}
+                    style={{ display: 'flex', gap: 10, padding: '5px 0', borderTop: '1px solid #2c2c32' }}
+                  >
+                    <span style={{ color: '#8a8a93', fontVariantNumeric: 'tabular-nums' }}>
+                      {new Date(a.at).toLocaleTimeString('zh-CN', { hour12: false })}
+                    </span>
+                    <span style={{ color: DECISION_COLOR[a.decision], width: 40 }}>{a.decision}</span>
+                    <span style={{ width: 120 }}>{a.tool}</span>
+                    <span style={{ flex: 1, color: '#8a8a93', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {a.summary}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
           </Card>
 
           <Card title="番茄钟">

@@ -56,9 +56,9 @@ Phase 8  打磨与发布            ─  v4
 | 2.2 PetStateMachine | ✅ `reduce(state, event)` 纯函数 + 16 个单元测试；秒级 tick 推进体力/心情/饱腹/口渴；饿渴到阈值自动去吃喝。时间从外面以 `Event::Tick { minutes }` 喂进来，所以「四小时后会饿」能在测试里瞬间验证，离线补算也复用同一段代码。`Ill` 要「连续 3 天 PoorCondition」，需要在流水上做跨天统计，留给 Phase 7 的 Mood Engine |
 | 2.3 Scheduler | ✅ 一次性 / 周期；持久化在 `kv` 表；重启补发（过期的响一次，周期的下一次从现在起算）。**没用 tokio**——已有每秒一拍的心跳，再起一套调度只是多一个要对齐的时钟；到期判断做成纯函数，时间由外面喂。cron 等到真有按周/按月的需求再说 |
 | 2.4 Pomodoro Engine | ✅ 相位机（25/5，四个一轮转长休 15，节奏可配）；`pomodoro:tick` / `pomodoro:phase`。跑着时把宠物按在对应的事情上（专注→work、休息→rest），但生理急需压得过它——番茄钟不该把人饿死 |
-| 2.5 ToolRegistry + PermissionGate + AuditLog | 协议见 03 §5–6；内建工具：`start_pomodoro` `stop_pomodoro` `create_timer` `cancel_timer` `get_pet_state` `set_setting` `get_setting` `set_permission` `system_notify` |
-| 2.6 Secrets | `keyring` crate 存 API key；`get_secret` 命令 |
-| 2.7 命令与事件面 | 03 §5 列出的全部 `invoke` / `emit` |
+| 2.5 ToolRegistry + PermissionGate + AuditLog | ✅ `list_tools` / `run_tool` / `recent_audit`，固定走「查工具 → 过权限门 → 执行 → 落审计」。已建：`create_timer` `cancel_timer` `list_timers` `start_pomodoro` `stop_pomodoro` `get_pet_state` `set_permission`。`set_setting` / `get_setting` 等 settings 真有人读时再加；`system_notify` 等系统通知那条路打通再加。`Ask` 的确认气泡是 Phase 3 的 UX，在那之前一律按拒绝处理 |
+| 2.6 Secrets | ⬜ 等 Phase 3 真的要用 API key 时再做——现在没有任何东西需要密钥，提前建一个空的密钥库只是摆设 |
+| 2.7 命令与事件面 | 🚧 已有 `pet:state` `pet:prompt` `timer:fired` `pomodoro:tick` `pomodoro:phase` `tool:confirm` `audit:appended`。`agent:trigger` 等 Phase 6 的 Observer；`build_context` / `session_append` / `memory_upsert` 等 Brain 和记忆到位 |
 
 **DoD**：不开 Brain，用 Panel 里的调试按钮调用 `run_tool("create_timer", {duration:"10s"})` → 10 秒后气泡出现、宠物动画切换、`audit` 表多一行；杀掉进程重启，未到期的计时器仍会触发。
 
