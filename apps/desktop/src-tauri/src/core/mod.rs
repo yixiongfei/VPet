@@ -4,5 +4,6 @@
 pub mod actions;
 pub mod db;
 pub mod food;
+pub mod pomodoro;
 pub mod scheduler;
 pub mod state_machine;

@@ -13,6 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use core::actions::Catalog;
 use core::db::Db;
 use core::food::{FoodItem, FoodShelf};
+use core::pomodoro::{Phase, Pomodoro, Tick as PomoTick};
 use core::scheduler::{parse_duration, Scheduler, Timer};
 use core::state_machine::{catch_up, reduce, Event, Pet, PetState, Touch};
 
@@ -206,6 +207,7 @@ fn spawn_pet_clock(app: AppHandle) {
                 let _ = app.emit("pet:state", next.state.clone());
             }
             fire_due_timers(&app);
+            advance_pomodoro(&app, TICK.as_secs_f32());
 
             if last_persist.elapsed() >= PERSIST_EVERY {
                 last_persist = Instant::now();
@@ -279,6 +281,70 @@ fn restore_state(app: &AppHandle, cat: &Catalog, shelf: &FoodShelf) -> Pet {
     };
     app.manage(Mutex::new(db));
     restored
+}
+
+/// 开始番茄钟。已经在跑就返回当前进度，不会把它清零
+#[tauri::command]
+fn start_pomodoro(app: AppHandle) -> Option<PomoTick> {
+    let pomo = app.state::<Mutex<Pomodoro>>();
+    let started = {
+        let Ok(mut p) = pomo.lock() else { return None };
+        let fresh = p.start().is_some();
+        if fresh {
+            log::info!("番茄钟开始，{:.0} 分钟专注", p.rhythm.focus_min);
+        }
+        (fresh, p.snapshot())
+    };
+    if started.0 {
+        apply(&app, &Event::Pin(Some("work".into())));
+        let _ = app.emit("pomodoro:phase", PhaseEvent { from: Phase::Focus, to: Phase::Focus });
+    }
+    started.1
+}
+
+/// 停掉番茄钟，返回这一轮完成了几个专注
+#[tauri::command]
+fn stop_pomodoro(app: AppHandle) -> Option<u32> {
+    let pomo = app.state::<Mutex<Pomodoro>>();
+    let done = {
+        let Ok(mut p) = pomo.lock() else { return None };
+        p.stop()
+    }?;
+    log::info!("番茄钟结束，完成 {done} 个专注");
+    apply(&app, &Event::Pin(None));
+    Some(done)
+}
+
+#[tauri::command]
+fn get_pomodoro(pomo: State<'_, Mutex<Pomodoro>>) -> Option<PomoTick> {
+    pomo.lock().ok().and_then(|p| p.snapshot())
+}
+
+#[derive(Clone, serde::Serialize)]
+struct PhaseEvent {
+    from: Phase,
+    to: Phase,
+}
+
+/// 番茄钟跟着心跳走。相位变了就换她该做的事，并告诉 Body
+fn advance_pomodoro(app: &AppHandle, sec: f32) {
+    let (change, snap) = {
+        let pomo = app.state::<Mutex<Pomodoro>>();
+        let Ok(mut p) = pomo.lock() else { return };
+        if !p.is_running() {
+            return;
+        }
+        (p.advance(sec), p.snapshot())
+    };
+    if let Some(c) = change {
+        log::info!("番茄钟：{} → {}（已完成 {}）", c.from.label(), c.to.label(), c.completed);
+        let tag = if c.to == Phase::Focus { "work" } else { "rest" };
+        apply(app, &Event::Pin(Some(tag.into())));
+        let _ = app.emit("pomodoro:phase", PhaseEvent { from: c.from, to: c.to });
+    }
+    if let Some(t) = snap {
+        let _ = app.emit("pomodoro:tick", t);
+    }
 }
 
 /// 排一个计时器。`duration` 按人写的方式给：`"10s"` `"25m"` `"1h"`
@@ -423,6 +489,7 @@ pub fn run() {
                 log::info!("读回 {} 个计时器", timers.len());
             }
             app.manage(Mutex::new(timers));
+            app.manage(Mutex::new(Pomodoro::default()));
             app.manage(Mutex::new(restored));
             if let Some(win) = app.get_webview_window(PET_WINDOW) {
                 place_bottom_right(&win);
@@ -448,7 +515,10 @@ pub fn run() {
             give_gift,
             create_timer,
             cancel_timer,
-            list_timers
+            list_timers,
+            start_pomodoro,
+            stop_pomodoro,
+            get_pomodoro
         ])
         .build(tauri::generate_context!())
         .expect("VPet 启动失败")

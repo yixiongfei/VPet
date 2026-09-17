@@ -217,6 +217,7 @@ mod tests {
             elapsed: 12.0,
             earned: 5.0,
             cooldowns: [("work_copy".to_string(), 20.0)].into_iter().collect(),
+            pinned_tag: None,
         };
         db.record_pet_state(&p).unwrap();
         let back = db.latest_pet_state().unwrap().unwrap();

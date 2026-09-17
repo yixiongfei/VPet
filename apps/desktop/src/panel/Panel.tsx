@@ -7,6 +7,23 @@ import { Gauge } from './Gauge'
 /** 面板刷新节奏。Core 只在换动作时推事件，数值得自己拉 */
 const REFRESH_MS = 1000
 
+interface Pomo {
+  phase: 'focus' | 'shortbreak' | 'longbreak'
+  remainingSec: number
+  completed: number
+}
+
+const PHASE_LABEL: Record<Pomo['phase'], string> = {
+  focus: '专注',
+  shortbreak: '短休',
+  longbreak: '长休',
+}
+
+const mmss = (sec: number) => {
+  const s = Math.max(0, Math.round(sec))
+  return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`
+}
+
 interface TimerRow {
   id: string
   label: string
@@ -28,12 +45,14 @@ export function Panel() {
   const [version, setVersion] = useState('')
   const [gift, setGift] = useState<string | null>(null)
   const [timers, setTimers] = useState<TimerRow[]>([])
+  const [pomo, setPomo] = useState<Pomo | null>(null)
 
   useEffect(() => {
     void invokeCore<string>('app_version').then((v) => v && setVersion(v))
     const pull = () => {
       void invokeCore<PetState>('get_pet_state').then((s) => s && setState(s))
       void invokeCore<TimerRow[]>('list_timers').then((t) => t && setTimers(t))
+      void invokeCore<Pomo | null>('get_pomodoro').then(setPomo)
     }
     pull()
     const timer = window.setInterval(pull, REFRESH_MS)
@@ -119,6 +138,32 @@ export function Panel() {
               </Btn>
             </Row>
             {gift && <p style={{ color: '#a8d5a2', marginBottom: 0 }}>送出了：{gift}</p>}
+          </Card>
+
+          <Card title="番茄钟">
+            {pomo ? (
+              <>
+                <div style={{ display: 'flex', alignItems: 'baseline', gap: 14, marginBottom: 12 }}>
+                  <strong style={{ fontSize: 30, fontVariantNumeric: 'tabular-nums' }}>
+                    {mmss(pomo.remainingSec)}
+                  </strong>
+                  <span style={{ color: pomo.phase === 'focus' ? '#8ab4f8' : '#a8d5a2' }}>
+                    {PHASE_LABEL[pomo.phase]}
+                  </span>
+                  <span style={{ color: '#8a8a93', fontSize: 13 }}>已完成 {pomo.completed} 个</span>
+                </div>
+                <Btn onClick={() => void invokeCore('stop_pomodoro').then(() => setPomo(null))}>停止</Btn>
+              </>
+            ) : (
+              <>
+                <p style={{ margin: '0 0 12px', color: '#8a8a93', fontSize: 13 }}>
+                  25 / 5，四个一轮转长休。跑着的时候她会一直干活，只有饿到不行才会去吃。
+                </p>
+                <Btn onClick={() => void invokeCore<Pomo>('start_pomodoro').then((p) => p && setPomo(p))}>
+                  开始专注
+                </Btn>
+              </>
+            )}
           </Card>
 
           <Card title="计时器">

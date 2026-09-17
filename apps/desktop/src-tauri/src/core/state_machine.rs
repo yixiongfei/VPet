@@ -120,6 +120,9 @@ pub struct Pet {
     pub earned: f32,
     /// 动作 id → 还要等多少分钟才能再做
     pub cooldowns: HashMap<String, f32>,
+    /// 番茄钟把她按在某类事情上（专注 → work，休息 → rest）。
+    /// 生理急需仍然能压过它——番茄钟不该把人饿死
+    pub pinned_tag: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +137,8 @@ pub enum Event {
     /// 时间流逝。`hour` 是当前钟点（0–24），决定「到点该做什么」
     Tick { minutes: f32, hour: f32 },
     Touched(Touch),
+    /// 番茄钟把她按在某类事情上；None = 松开
+    Pin(Option<String>),
     /// 用户送了样东西。她自己不会凭空收到礼物，所以这条只能从外面来
     Gifted { id: String, name: String },
     /// 调试用：直接改数值，用来验证阈值行为
@@ -228,6 +233,16 @@ pub fn reduce(cat: &Catalog, shelf: &FoodShelf, p: &Pet, e: &Event) -> Pet {
                 });
                 n.elapsed = 0.0;
                 n.earned = 0.0;
+            }
+        }
+        Event::Pin(tag) => {
+            n.pinned_tag = tag.clone();
+            // 立刻换过去，不等下一拍
+            if let Some(t) = tag {
+                if let Some(a) = best(cat, t, |a| meets(a, &n.state)) {
+                    let pick = (a, "番茄钟");
+                    adopt(shelf, &mut n, pick);
+                }
             }
         }
         Event::Touched(t) => {
@@ -347,7 +362,7 @@ fn tick(cat: &Catalog, shelf: &FoodShelf, n: &mut Pet, minutes: f32, hour: f32) 
     // 4. 过场动画不许打断；其余情况没事做或该换事做时重新决策
     let busy = n.state.activity.is_transient() && !done;
     if !busy && (n.state.action.is_none() || should_switch(cat, n, hour)) {
-        let chosen = decide(cat, &n.state, &n.cooldowns, hour);
+        let chosen = decide_with_pin(cat, &n.state, &n.cooldowns, hour, n.pinned_tag.as_deref());
         adopt(shelf, n, chosen);
     }
 }
@@ -364,6 +379,10 @@ fn should_switch(cat: &Catalog, n: &Pet, hour: f32) -> bool {
     }
     if n.state.feeling < MISERABLE {
         return !cur.has_tag("cheer");
+    }
+    // 番茄钟按着的时候，只要还在该做的那一类里就别换
+    if let Some(tag) = n.pinned_tag.as_deref() {
+        return !cur.has_tag(tag);
     }
     // 排了时段的事，过了点就收手（下班了就别干了）
     if cur.is_scheduled() && !cur.fits_hour(hour) {
@@ -382,6 +401,17 @@ pub fn decide<'a>(
     s: &PetState,
     cd: &HashMap<String, f32>,
     hour: f32,
+) -> (&'a ActionDef, &'static str) {
+    decide_with_pin(cat, s, cd, hour, None)
+}
+
+/// 番茄钟跑着的时候，除了生理急需，其余一律听它的
+pub fn decide_with_pin<'a>(
+    cat: &'a Catalog,
+    s: &PetState,
+    cd: &HashMap<String, f32>,
+    hour: f32,
+    pinned: Option<&str>,
 ) -> (&'a ActionDef, &'static str) {
     let ok = |a: &ActionDef| meets(a, s) && !cd.contains_key(&a.id);
     // 急需时连冷却都不管——真饿了不会因为「刚吃过」就饿着
@@ -406,6 +436,13 @@ pub fn decide<'a>(
     if s.feeling < MISERABLE {
         if let Some(a) = best(cat, "cheer", |a| meets(a, s)) {
             return (a, "实在撑不住了");
+        }
+    }
+
+    // 番茄钟：生理这关过了就听它的，作息和心情都往后排
+    if let Some(tag) = pinned {
+        if let Some(a) = best(cat, tag, |a| meets(a, s)) {
+            return (a, "番茄钟");
         }
     }
 
@@ -1013,6 +1050,53 @@ mod tests {
                 "礼物得是别人给的，不能自己长出来"
             );
         }
+    }
+
+    /* ---- 番茄钟联动 ---- */
+
+    #[test]
+    fn 番茄钟按住她就去工作() {
+        let c = cat();
+        let mut p = Pet::default();
+        // 半夜，本来该睡觉
+        p = reduce(&c, &shelf(), &p, &Event::Pin(Some("work".into())));
+        assert_eq!(p.state.activity, Activity::Working, "番茄钟说专注就该专注");
+        p = reduce(&c, &shelf(), &p, &Event::Tick { minutes: 1.0, hour: 2.0 });
+        assert_eq!(p.state.activity, Activity::Working, "作息不该把她拽去睡");
+    }
+
+    #[test]
+    fn 番茄钟松开就回正常作息() {
+        let c = cat();
+        let mut p = Pet::default();
+        p = reduce(&c, &shelf(), &p, &Event::Pin(Some("work".into())));
+        p = reduce(&c, &shelf(), &p, &Event::Pin(None));
+        p = reduce(&c, &shelf(), &p, &Event::Tick { minutes: 1.0, hour: 2.0 });
+        assert_eq!(p.state.activity, Activity::Sleeping, "松开后凌晨两点该睡觉");
+    }
+
+    #[test]
+    fn 番茄钟不该把人饿死() {
+        let c = cat();
+        let mut p = Pet::default();
+        p.state.hunger = 3.0;
+        p = reduce(&c, &shelf(), &p, &Event::Pin(Some("work".into())));
+        p = reduce(&c, &shelf(), &p, &Event::Tick { minutes: 1.0, hour: 10.0 });
+        assert_eq!(
+            p.state.activity,
+            Activity::Eating,
+            "生理急需要能压过番茄钟"
+        );
+    }
+
+    #[test]
+    fn 番茄钟休息相位会让她歇着() {
+        let c = cat();
+        let mut p = Pet::default();
+        p = reduce(&c, &shelf(), &p, &Event::Pin(Some("rest".into())));
+        p = reduce(&c, &shelf(), &p, &Event::Tick { minutes: 1.0, hour: 10.0 });
+        let a = p.state.action.as_ref().unwrap();
+        assert!(c.get(&a.id).unwrap().has_tag("rest"), "在 {}", a.name);
     }
 
     #[test]
