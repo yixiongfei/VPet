@@ -1,10 +1,4 @@
-import { IS_TAURI, invokeCore } from './ipc'
-
-type WindowApi = typeof import('@tauri-apps/api/window')
-type DpiApi = typeof import('@tauri-apps/api/dpi')
-
-let api: Promise<[WindowApi, DpiApi]> | null = null
-const loadApi = () => (api ??= Promise.all([import('@tauri-apps/api/window'), import('@tauri-apps/api/dpi')]))
+import { invokeCore } from './ipc'
 
 /** 把当前帧的命中掩码推给 Rust 的穿透判定（按位打包的 48×48） */
 export const pushHitMask = (cells: Uint8Array) => void invokeCore('set_hit_mask', { cells: Array.from(cells) })
@@ -25,21 +19,20 @@ export const reportTouch = (zone: string) => void invokeCore('pet_touched', { zo
 export const pushFoodCatalog = (items: unknown[]) => void invokeCore('set_food_catalog', { items })
 
 /** 送她一样礼物（随机挑一件）。返回礼物名字，没货架时返回 null */
-export const giveGift = () => invokeCore<string>('give_gift')
+export const giveGift = (id?: string) => invokeCore<string>('give_gift', { id })
 
 /**
  * 按逻辑像素平移宠物窗口——提起时用来让窗口跟住光标。
  * 浏览器预览里没有 Tauri，静默跳过（动画照常，只是窗口不动）。
  */
-export async function moveWindowBy(dx: number, dy: number): Promise<void> {
-  if (!IS_TAURI || (dx === 0 && dy === 0)) return
-  try {
-    const [{ getCurrentWindow }, { LogicalPosition }] = await loadApi()
-    const win = getCurrentWindow()
-    const scale = await win.scaleFactor()
-    const pos = (await win.outerPosition()).toLogical(scale)
-    await win.setPosition(new LogicalPosition(pos.x + dx, pos.y + dy))
-  } catch (e) {
-    console.warn('[VPet] 移动窗口失败', e)
-  }
+// Serialize begin/end so a quick release cannot overtake an async begin IPC.
+let dragQueue: Promise<unknown> = Promise.resolve()
+export function beginPetDrag(anchorX: number, anchorY: number): void {
+  dragQueue = dragQueue.then(() => invokeCore('begin_pet_drag', { anchorX, anchorY }))
 }
+export function endPetDrag(): void {
+  dragQueue = dragQueue.then(() => invokeCore('end_pet_drag'))
+}
+
+export const openChat = () => invokeCore('open_chat')
+export const openSettingsPanel = () => invokeCore('open_settings_panel')

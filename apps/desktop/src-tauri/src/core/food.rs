@@ -43,6 +43,18 @@ pub struct FoodShelf {
 }
 
 impl FoodShelf {
+    /// Startup must not depend on the pet WebView finishing its asynchronous asset load.
+    pub fn bundled() -> Self {
+        let items = serde_json::from_str(include_str!("../../food-catalog.json"))
+            .expect("bundled food catalog must contain valid FoodItem records");
+        Self { items }
+    }
+
+    pub fn gifts(&self) -> Vec<FoodItem> {
+        self.items.iter().filter(|item| item.graph == "gift" && item.kind == "Gift")
+            .cloned().collect()
+    }
+
     pub fn set(&mut self, items: Vec<FoodItem>) {
         self.items = items;
     }
@@ -105,6 +117,19 @@ fn score(f: &FoodItem, need: Need) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_gifts_available_before_webview_starts() {
+        let shelf = FoodShelf::bundled();
+        assert_eq!(shelf.len(), 123);
+        assert_eq!(shelf.gifts().len(), 20);
+        for seed in 0..20 {
+            let gift = shelf.random("gift", seed).unwrap();
+            assert_eq!(gift.kind, "Gift");
+            assert!(!gift.name.is_empty());
+            assert!(shelf.get(&gift.id).is_some());
+        }
+    }
 
     fn item(id: &str, graph: &str, kind: &str, food: f32, drink: f32, feel: f32, price: f32) -> FoodItem {
         FoodItem {

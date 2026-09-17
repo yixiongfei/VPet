@@ -19,3 +19,10 @@ Thumbs.db
 
 # Claude 桌面端的本地预览配置
 .claude/launch.json
+
+# Local model runtime, model weights and private training output
+.runtime/
+training/data/
+training/output/
+training/.venv/
+__pycache__/

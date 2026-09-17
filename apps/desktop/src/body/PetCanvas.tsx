@@ -2,32 +2,60 @@ import { Verdict } from '@vpet/shared'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { AnimationPlayer } from './AnimationPlayer'
 import { Bubble } from './Bubble'
-import { ChatInput } from './ChatInput'
 import { subscribe } from './events'
 import { HitMask } from './hitMask'
 import { Interaction } from './interaction'
 import { loadManifest, loadProfile } from './manifest'
-import { invokeCore } from './ipc'
 import { fetchPetState, subscribePetState } from './petState'
-import { pushFoodCatalog, pushHitMask, reportTouch } from './petWindow'
-import { cannedReply, hideDelayMs } from './say'
+import { openChat, openSettingsPanel, pushFoodCatalog, pushHitMask, reportTouch } from './petWindow'
+import { hideDelayMs } from './say'
 import { toLogical } from './touch'
-
-interface BubbleState {
-  text: string
-  streaming: boolean
-}
 
 export function PetCanvas() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
+  const maskRef = useRef<HitMask | null>(null)
   const interactionRef = useRef<Interaction | null>(null)
-  const sayGen = useRef(0)
   const hideTimer = useRef(0)
   const [error, setError] = useState<string | null>(null)
-  const [size, setSize] = useState(500)
   const [name, setName] = useState('VPet')
-  const [bubble, setBubble] = useState<BubbleState | null>(null)
-  const [inputOpen, setInputOpen] = useState(false)
+  const [bubble, setBubble] = useState<string | null>(null)
+  const [streaming, setStreaming] = useState(false)
+  const streamRef = useRef<{ id: string; text: string } | null>(null)
+  const [hovered, setHovered] = useState(false)
+  const [dragging, setDragging] = useState(false)
+
+  const announce = useCallback((text: string) => {
+    window.clearTimeout(hideTimer.current)
+    streamRef.current = null
+    setStreaming(false)
+    setBubble(text)
+    hideTimer.current = window.setTimeout(() => setBubble(null), hideDelayMs(text))
+  }, [])
+
+  /** 聊天窗口里她在说什么，桌面上的她也同步「说」出来（流式气泡） */
+  const onChatStream = useCallback((payload: unknown) => {
+    const event = payload as { requestId?: string; delta?: string; done?: boolean; text?: string } | null
+    if (!event?.requestId) return
+    const current = streamRef.current
+    if (event.done) {
+      if (current?.id !== event.requestId) return
+      streamRef.current = null
+      setStreaming(false)
+      // Core 收尾时会把清理过的最终文本带回来（去掉模型拖出的旁白），以它为准
+      const text = (event.text ?? current.text).trim()
+      if (!text) { setBubble(null); return }
+      setBubble(text)
+      hideTimer.current = window.setTimeout(() => setBubble(null), hideDelayMs(text))
+      return
+    }
+    window.clearTimeout(hideTimer.current)
+    const next = current?.id === event.requestId
+      ? { id: event.requestId, text: current.text + (event.delta ?? '') }
+      : { id: event.requestId, text: event.delta ?? '' }
+    streamRef.current = next
+    setStreaming(true)
+    setBubble(next.text)
+  }, [])
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -39,164 +67,100 @@ export function PetCanvas() {
     Promise.all([loadManifest(), loadProfile()])
       .then(([manifest, profile]) => {
         if (disposed) return
-        setSize(manifest.size)
         setName(profile.name)
         player = new AnimationPlayer(canvas, manifest)
-        // 每帧重算 alpha 掩码推给 Rust 的穿透判定（掩码没变就不推）
+        // Preserve source resolution; fit viewport at every desktop size.
+        canvas.style.width = '100%'
+        canvas.style.height = '100%'
         const mask = new HitMask()
+        maskRef.current = mask
         player.onFrame = (composited) => {
           const changed = mask.update(composited)
-          if (changed) void pushHitMask(changed)
+          if (changed) pushHitMask(changed)
         }
-        // 摸到了就报给 Core，数值怎么变由状态机决定（docs/03 §7）
-        const interaction = new Interaction({ player, manifest, profile, onTouch: reportTouch })
+        const interaction = new Interaction({
+          player, manifest, profile,
+          onTouch: reportTouch,
+          onClick: () => void openChat(),
+          onDragChange: setDragging,
+        })
         interactionRef.current = interaction
         interaction.start()
-        // Core 要按需求和钱包挑吃的，先把目录给它
         pushFoodCatalog(manifest.food)
-        stops.push(subscribePetState((s) => interaction.setState(s)))
-        // Core 只在活动/心情变化时才推，启动时先主动拉一次
-        void fetchPetState().then((s) => { if (s && !disposed) interaction.setState(s) })
-        // Rust 侧全局快捷键按下时发这个事件（见 src-tauri/src/lib.rs）
-        stops.push(subscribe('pet:prompt', () => setInputOpen(true)))
-        // 计时器响了：说一句。Phase 3 起这句话由 Brain 来写
-        stops.push(
-          subscribe('timer:fired', (payload) => {
-            const label = (payload as { label?: string } | null)?.label
-            if (label) announce(`⏰ ${label}`)
-          }),
-        )
-        // 服从判定：你让她做事，她答应或者拒绝，都在气泡里回一句
-        stops.push(
-          subscribe('pet:said', (payload) => {
-            const v = Verdict.safeParse(payload)
-            if (v.success) announce(v.data.say)
-          }),
-        )
-        console.info(
-          `[VPet] ${profile.name} 载入：${manifest.clips.length} clips · ${manifest.size}px · ${manifest.generatedAt}`,
-        )
+        stops.push(subscribePetState((state) => interaction.setState(state)))
+        void fetchPetState().then((state) => { if (state && !disposed) interaction.setState(state) })
+        stops.push(subscribe('pet:prompt', () => void openChat()))
+        stops.push(subscribe('chat-stream', onChatStream))
+        stops.push(subscribe('pet:drag-ended', () => interaction.onPointerUp(true)))
+        stops.push(subscribe('pet:gift', (payload) => {
+          const received = payload as { say?: string }
+          if (received?.say) announce(received.say)
+        }))
+        stops.push(subscribe('timer:fired', (payload) => {
+          const label = (payload as { label?: string } | null)?.label
+          if (label) announce('⏰ ' + label)
+        }))
+        stops.push(subscribe('pet:said', (payload) => {
+          const result = Verdict.safeParse(payload)
+          if (result.success) announce(result.data.say)
+        }))
       })
       .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
 
+    const cancel = () => interactionRef.current?.onPointerUp(true)
+    window.addEventListener('blur', cancel)
     return () => {
       disposed = true
-      stops.forEach((f) => f())
+      stops.forEach((stop) => stop())
+      window.removeEventListener('blur', cancel)
       window.clearTimeout(hideTimer.current)
       interactionRef.current?.dispose()
       interactionRef.current = null
+      maskRef.current = null
       player?.destroy()
     }
-  }, [])
+  }, [announce, onChatStream])
 
-  /** 弹一句现成的话（计时器之类），不走流式 */
-  const announce = useCallback((text: string) => {
-    const gen = ++sayGen.current
-    window.clearTimeout(hideTimer.current)
-    interactionRef.current?.startSay()
-    setBubble({ text, streaming: false })
-    interactionRef.current?.endSay()
-    hideTimer.current = window.setTimeout(() => {
-      if (gen === sayGen.current) setBubble(null)
-    }, hideDelayMs(text))
-  }, [])
-
-  const closeBubble = useCallback(() => {
-    sayGen.current++ // 作废进行中的流
-    window.clearTimeout(hideTimer.current)
-    setBubble(null)
-    interactionRef.current?.endSay()
-  }, [])
-
-  /** 流式把一段回话吐进气泡。Phase 3 把 cannedReply 换成 Brain 的 token 流即可 */
-  const say = useCallback(async (userText: string) => {
-    // 记忆命令（「记住：…」「忘记…」「你记得我什么」）先在 Core 里解析。
-    // 解析不出来才走对话——**普通闲聊不写长期记忆**，这是那条原则在前端的落点。
-    // 放在 Brain 之前是故意的：这些命令是确定性的，不该消耗一次模型调用
-    const memoryReply = await invokeCore<string | null>('memory_command', { text: userText })
-    if (memoryReply) {
-      announce(memoryReply)
-      return
-    }
-    const gen = ++sayGen.current
-    window.clearTimeout(hideTimer.current)
-    interactionRef.current?.startSay()
-    setBubble({ text: '', streaming: true })
-    let acc = ''
-    for await (const chunk of cannedReply(userText)) {
-      if (gen !== sayGen.current) return
-      acc += chunk
-      setBubble({ text: acc, streaming: true })
-    }
-    if (gen !== sayGen.current) return
-    setBubble({ text: acc, streaming: false })
-    interactionRef.current?.endSay()
-    hideTimer.current = window.setTimeout(() => {
-      if (gen === sayGen.current) setBubble(null)
-    }, hideDelayMs(acc))
-  }, [])
-
-  // Esc：先收输入框，再收气泡
-  useEffect(() => {
-    const h = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape') return
-      if (inputOpen) setInputOpen(false)
-      else if (bubble) closeBubble()
-    }
-    window.addEventListener('keydown', h)
-    return () => window.removeEventListener('keydown', h)
-  }, [inputOpen, bubble, closeBubble])
-
-  const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (e.button !== 0) return
-    // 捕获指针：提起后光标移出窗口也还能收到 move / up
-    e.currentTarget.setPointerCapture(e.pointerId)
-    const p = toLogical(e.currentTarget, e.clientX, e.clientY)
-    interactionRef.current?.onPointerDown(p.x, p.y)
+  const onPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return
+    const point = toLogical(event.currentTarget, event.clientX, event.clientY)
+    if (maskRef.current && !maskRef.current.isOpaqueAt(point.x, point.y)) return
+    event.currentTarget.setPointerCapture(event.pointerId)
+    interactionRef.current?.onPointerDown(point.x, point.y, event.screenX, event.screenY)
   }
 
-  const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
-    const p = toLogical(e.currentTarget, e.clientX, e.clientY)
-    interactionRef.current?.onPointerMove(p.x, p.y)
+  const onPointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    const point = toLogical(event.currentTarget, event.clientX, event.clientY)
+    setHovered(maskRef.current?.isOpaqueAt(point.x, point.y) ?? true)
+    interactionRef.current?.onPointerMove(point.x, point.y, event.screenX, event.screenY)
   }
 
-  const onPointerUp = () => interactionRef.current?.onPointerUp()
+  const onPointerUp = (event: React.PointerEvent<HTMLDivElement>) => {
+    interactionRef.current?.onPointerUp()
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId)
+  }
 
   return (
     <div
-      style={{ width: size, height: size, position: 'relative', touchAction: 'none' }}
+      style={{ width: '100%', height: '100%', position: 'relative', touchAction: 'none', cursor: dragging ? 'grabbing' : hovered ? 'pointer' : 'default' }}
+      title="单击聊天 · 按住拖动 · 右键打开设置"
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
-      onPointerCancel={onPointerUp}
-      onDoubleClick={() => setInputOpen(true)}
+      onPointerCancel={() => interactionRef.current?.onPointerUp(true)}
+      onLostPointerCapture={() => interactionRef.current?.onPointerUp(true)}
+      onPointerLeave={() => setHovered(false)}
+      onContextMenu={(event) => { event.preventDefault(); void openSettingsPanel() }}
     >
       <canvas ref={canvasRef} />
-
-      {(bubble || inputOpen) && (
-        <div
-          // 气泡在上、输入框在下，一起贴着窗口底部（docs/05 §4）
-          style={{ position: 'absolute', left: 8, right: 8, bottom: 8, display: 'flex', flexDirection: 'column', gap: 8 }}
-          // 别让点气泡/输入框的动作被宠物当成摸
-          onPointerDown={(e) => e.stopPropagation()}
-          onDoubleClick={(e) => e.stopPropagation()}
-        >
-          {bubble && <Bubble name={name} text={bubble.text} streaming={bubble.streaming} onClose={closeBubble} />}
-          {inputOpen && <ChatInput onSubmit={(t) => void say(t)} onCancel={() => setInputOpen(false)} />}
+      {bubble && (
+        <div style={{ position: 'absolute', left: 8, right: 8, bottom: 8, pointerEvents: 'none' }}>
+          <Bubble name={name} text={bubble} streaming={streaming} onClose={() => setBubble(null)} />
         </div>
       )}
-
       {error && (
-        <div
-          style={{
-            position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', padding: 24, textAlign: 'center',
-            font: '14px/1.6 system-ui, sans-serif', color: '#fff', background: 'rgba(0,0,0,.72)', borderRadius: 16,
-          }}
-        >
-          <div>
-            <div style={{ fontSize: 28, marginBottom: 8 }}>(´・ω・`)</div>
-            <div>{error}</div>
-          </div>
+        <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', padding: 24, textAlign: 'center', font: '14px/1.6 system-ui, sans-serif', color: '#fff', background: 'rgba(0,0,0,.72)', borderRadius: 16 }}>
+          <div><div style={{ fontSize: 28, marginBottom: 8 }}>VPet</div>{error}</div>
         </div>
       )}
     </div>

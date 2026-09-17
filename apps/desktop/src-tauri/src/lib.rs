@@ -6,6 +6,8 @@
 //! 调度 / 番茄钟 / 工具 / 权限还没做，见 docs/03-architecture.md §3 与 docs/07 Phase 2。
 
 mod core;
+mod desktop_settings;
+mod chat;
 
 use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -20,9 +22,7 @@ use core::tools::{
     PermissionGate, ToolCall, ToolDef, ToolResult,
 };
 use core::bias::{BiasView, DEFAULT_HALF_LIFE};
-use core::embed::EmbedState;
-#[cfg(feature = "_onnx")]
-use core::embed::Embedder;
+use core::embed::{ollama::ConnectError, EmbedBackend, EmbedState, OllamaEmbedder};
 use core::memory::{
     self, BigramRetriever, Command, Health, Hit, MemoryItem, MemoryType, Retriever, Source, Status,
     WriteOutcome,
@@ -40,6 +40,7 @@ use tauri_plugin_global_shortcut::Shortcut;
 
 const PET_WINDOW: &str = "pet";
 const PANEL_WINDOW: &str = "panel";
+const CHAT_WINDOW: &str = "chat";
 
 /// 呼出输入框的全局快捷键（docs/05 §4 的默认值，Q 待确认）
 const PROMPT_SHORTCUT: &str = "Alt+V";
@@ -49,7 +50,7 @@ const MASK_N: usize = 48;
 /// 掩码坐标系的边长（pet.json 的 500×500 逻辑参考系）
 const PET_LOGICAL_SIZE: f64 = 500.0;
 /// 光标轮询间隔（docs/05 §4）
-const POLL: Duration = Duration::from_millis(50);
+const POLL: Duration = Duration::from_millis(16);
 
 /// 状态推进的节拍。一秒一次，数值按 1/60 分钟走——比每分钟一跳平滑，
 /// 也让吃喝这种几秒钟的过场能踩准点
@@ -73,11 +74,16 @@ struct HitState {
     disabled: bool,
     /// 当前是否已穿透，只在变化时才真去调 set_ignore_cursor_events
     ignoring: bool,
+    /// Original press offset in the 500px reference coordinate system.
+    drag_anchor: Option<(f64, f64)>,
 }
 
 impl HitState {
     /// 逻辑坐标是否压在宠物身上
     fn opaque_at(&self, x: f64, y: f64) -> bool {
+        if !(0.0..PET_LOGICAL_SIZE).contains(&x) || !(0.0..PET_LOGICAL_SIZE).contains(&y) {
+            return false;
+        }
         let Some(mask) = &self.mask else {
             return true; // 还没有掩码：宁可不穿透
         };
@@ -368,16 +374,11 @@ fn retriever() -> BigramRetriever {
 
 /* ---------- 语义向量：加载、补算、检索 ---------- */
 
-/// 没开 `embed` feature 时的占位：整套语义检索就是不存在，
-/// 其余功能一行都不用改——降级必须是**结构上的**，不是靠运行时判断到处打补丁
-#[cfg(not(feature = "_onnx"))]
-type SharedEmbedder = ();
-#[cfg(feature = "_onnx")]
-type SharedEmbedder = std::sync::Arc<Embedder>;
+/// 后端无关：ORT 也好、Ollama 也好，装进来的都是这个
+type SharedEmbedder = std::sync::Arc<dyn EmbedBackend>;
 
 #[derive(Default)]
 struct EmbedSlot {
-    #[allow(dead_code)]
     inner: Option<SharedEmbedder>,
 }
 
@@ -396,41 +397,50 @@ fn set_embed_state(app: &AppHandle, st: EmbedState) {
     let _ = app.emit("embed:state", st);
 }
 
-#[cfg(feature = "_onnx")]
 fn embedder(app: &AppHandle) -> Option<SharedEmbedder> {
     app.try_state::<RwLock<EmbedSlot>>()
         .and_then(|s| s.read().ok().and_then(|g| g.inner.clone()))
 }
 
-#[cfg(not(feature = "_onnx"))]
-fn embedder(_app: &AppHandle) -> Option<SharedEmbedder> {
-    None
+/// 选后端。本地 ONNX 目录就绪（且编进了 `embed` feature）就用它——完全离线；
+/// 否则走本机 Ollama。Ollama 通常比桌宠晚几秒起来，连不上就等一等再试；
+/// 没装 embedding 模型则立刻放弃，把该 pull 什么写进状态里
+fn load_embed_backend(app: &AppHandle) -> Result<SharedEmbedder, String> {
+    #[cfg(feature = "_onnx")]
+    {
+        if let Ok(data) = app.path().app_data_dir() {
+            let dir = core::embed::model_dir(&data);
+            if core::embed::looks_ready(&dir) {
+                return core::embed::Embedder::load(&dir).map(|e| std::sync::Arc::new(e) as SharedEmbedder);
+            }
+        }
+    }
+    let endpoint = chat::embedding_endpoint(app);
+    let model = core::embed::ollama::model_name();
+    let mut last = String::new();
+    for attempt in 0..20 {
+        match OllamaEmbedder::connect(&endpoint, &model) {
+            Ok(e) => return Ok(std::sync::Arc::new(e)),
+            Err(ConnectError::Unreachable(msg)) => {
+                if attempt == 0 {
+                    log::info!("语义模型：{msg}，等 Ollama 起来再试");
+                }
+                last = msg;
+                std::thread::sleep(Duration::from_secs(3));
+            }
+            Err(err) => return Err(err.message().to_string()),
+        }
+    }
+    Err(last)
 }
 
 /// 后台加载模型。**绝不能挡着宠物出现在桌面上**——
-/// 几十 MB 的模型冷启动要几百毫秒到几秒，那段时间里字面检索照常工作
-#[cfg(feature = "_onnx")]
+/// 模型冷启动要几百毫秒到几秒（Ollama 还可能没起来），那段时间里字面检索照常工作
 fn spawn_embed_loader(app: AppHandle) {
-    let dir = match app.path().app_data_dir() {
-        Ok(d) => core::embed::model_dir(&d),
-        Err(e) => {
-            set_embed_state(&app, EmbedState::Disabled { reason: format!("取不到数据目录：{e}") });
-            return;
-        }
-    };
-    if !core::embed::looks_ready(&dir) {
-        set_embed_state(
-            &app,
-            EmbedState::Disabled {
-                reason: format!("{} 下没有 model.onnx / tokenizer.json", dir.display()),
-            },
-        );
-        return;
-    }
     set_embed_state(&app, EmbedState::Loading);
     std::thread::spawn(move || {
         let t0 = Instant::now();
-        match Embedder::load(&dir) {
+        match load_embed_backend(&app) {
             Ok(e) => {
                 let (name, dim) = (e.version().to_string(), e.dim());
                 log::info!("语义模型就绪：{name}（{dim} 维，{} ms）", t0.elapsed().as_millis());
@@ -445,7 +455,7 @@ fn spawn_embed_loader(app: AppHandle) {
                 };
                 if let Some(slot) = app.try_state::<RwLock<EmbedSlot>>() {
                     if let Ok(mut g) = slot.write() {
-                        g.inner = Some(std::sync::Arc::new(e));
+                        g.inner = Some(e);
                     }
                 }
                 set_embed_state(&app, EmbedState::Ready { name, dim });
@@ -462,13 +472,7 @@ fn spawn_embed_loader(app: AppHandle) {
     });
 }
 
-#[cfg(not(feature = "_onnx"))]
-fn spawn_embed_loader(app: AppHandle) {
-    set_embed_state(&app, EmbedState::Disabled { reason: "这个构建没有编进语义检索".into() });
-}
-
 /// 把还没算过向量的活跃记忆补上。分批做，别一口气把几千条塞进一次推理
-#[cfg(feature = "_onnx")]
 fn backfill_embeddings(app: &AppHandle) -> usize {
     const BATCH: usize = 16;
     let Some(e) = embedder(app) else { return 0 };
@@ -499,30 +503,25 @@ fn backfill_embeddings(app: &AppHandle) -> usize {
     done
 }
 
-#[cfg(not(feature = "_onnx"))]
-fn backfill_embeddings(_app: &AppHandle) -> usize {
-    0
-}
-
-/// 一条记忆写进去之后，顺手把向量也更新掉。
+/// 一条记忆写进去之后，顺手把向量也更新掉。放后台线程：`remember` 跑在主线程的
+/// 同步命令里，一次 embedding 是几十毫秒的 HTTP 往返，不该让宠物卡这一下。
 /// 失败不抛——记忆已经安全落库了，向量算不出来只是暂时检索不到它，
 /// 下一次补算会捡回来
-#[cfg(feature = "_onnx")]
 fn embed_one_memory(app: &AppHandle, m: &MemoryItem) {
     let Some(e) = embedder(app) else { return };
-    let Ok(v) = e.embed_one(&m.content) else { return };
-    if let Some(db) = app.try_state::<Mutex<Db>>() {
-        if let Ok(d) = db.lock() {
-            let _ = d.put_embedding(&m.id, &v, e.version());
+    let app = app.clone();
+    let (id, content) = (m.id.clone(), m.content.clone());
+    std::thread::spawn(move || {
+        let Ok(v) = e.embed_one(&content) else { return };
+        if let Some(db) = app.try_state::<Mutex<Db>>() {
+            if let Ok(d) = db.lock() {
+                let _ = d.put_embedding(&id, &v, e.version());
+            }
         }
-    }
+    });
 }
 
-#[cfg(not(feature = "_onnx"))]
-fn embed_one_memory(_app: &AppHandle, _m: &MemoryItem) {}
-
 /// 向量最近邻。模型没就绪就返回 None——调用方据此退回纯字面检索
-#[cfg(feature = "_onnx")]
 fn dense_candidates(app: &AppHandle, query: &str) -> Option<HashMap<String, f32>> {
     let e = embedder(app)?;
     let q = e.embed_query(query).ok()?;
@@ -532,28 +531,28 @@ fn dense_candidates(app: &AppHandle, query: &str) -> Option<HashMap<String, f32>
     Some(hits.into_iter().collect())
 }
 
-#[cfg(not(feature = "_onnx"))]
-fn dense_candidates(_app: &AppHandle, _query: &str) -> Option<HashMap<String, f32>> {
-    None
-}
-
 /// 现在到底在用哪种检索。悄悄降级是最坏的一种降级，所以这个要能被看到
 #[tauri::command]
 fn get_embed_state(app: AppHandle) -> EmbedState {
     embed_state(&app)
 }
 
-/// 手动重建向量索引。换了模型、或者怀疑索引和记忆对不上时用
+/// 手动重建向量索引。换了模型、或者怀疑索引和记忆对不上时用。
+/// 模型还没就绪（Ollama 当时没起来 / 模型刚 pull 好）就当作「再试一次加载」。
+/// async：补算是一串 HTTP 往返，别占着主线程
 #[tauri::command]
-fn rebuild_embeddings(app: AppHandle) -> usize {
-    #[cfg(feature = "_onnx")]
-    {
-        if let (Some(e), Some(db)) = (embedder(&app), app.try_state::<Mutex<Db>>()) {
-            if let Ok(d) = db.lock() {
-                // 传一个空版本号，逼它整张重建
-                let _ = d.ensure_vec_table(e.dim(), e.version());
-                let _ = d.clear_embedding_versions();
-            }
+async fn rebuild_embeddings(app: AppHandle) -> usize {
+    let Some(e) = embedder(&app) else {
+        if !matches!(embed_state(&app), EmbedState::Loading) {
+            spawn_embed_loader(app);
+        }
+        return 0;
+    };
+    if let Some(db) = app.try_state::<Mutex<Db>>() {
+        if let Ok(d) = db.lock() {
+            // 传一个空版本号，逼它整张重建
+            let _ = d.ensure_vec_table(e.dim(), e.version());
+            let _ = d.clear_embedding_versions();
         }
     }
     backfill_embeddings(&app)
@@ -663,21 +662,22 @@ fn forget_memory(app: AppHandle, query: String) -> Option<MemoryItem> {
 }
 
 /// 检索：给一句话，回最相关的几条。**会记一次使用**——
-/// 使用频次占排序权重的 0.10，不记就是空话
-#[tauri::command]
-fn search_memory(app: AppHandle, query: String, limit: Option<usize>) -> Vec<Hit> {
+/// 使用频次占排序权重的 0.10，不记就是空话。
+/// IPC 走 async 包装（稠密那一路是一次 HTTP 往返，别占主线程）；
+/// 记忆命令 / 工具调用等同步路径直接用这个
+fn search_hits(app: &AppHandle, query: &str, limit: Option<usize>) -> Vec<Hit> {
     let now = now_ms();
     let k = limit.unwrap_or(memory::TOP_K).min(20);
-    // 稠密候选拿不到（没模型 / 还在加载 / 加载失败）就退回纯字面，不报错
-    let dense = dense_candidates(&app, &query);
-    let hits = memory::retrieve_hybrid(
-        &memories(&app),
-        &query,
-        &retriever(),
-        dense.as_ref(),
-        now,
-        k,
-    );
+    let all = memories(app);
+    // 一条能用的记忆都没有就别算查询向量了——省一次 HTTP，更重要的是内存紧时
+    // 别为了一个必然为空的结果把 embedding 模型换进显存、把对话模型挤出去
+    let dense = if all.iter().any(|m| m.usable(now)) {
+        // 稠密候选拿不到（没模型 / 还在加载 / 加载失败）就退回纯字面，不报错
+        dense_candidates(app, query)
+    } else {
+        None
+    };
+    let hits = memory::retrieve_hybrid(&all, query, &retriever(), dense.as_ref(), now, k);
     if let Some(db) = app.try_state::<Mutex<Db>>() {
         if let Ok(d) = db.lock() {
             let ids: Vec<String> = hits.iter().map(|h| h.item.id.clone()).collect();
@@ -687,11 +687,20 @@ fn search_memory(app: AppHandle, query: String, limit: Option<usize>) -> Vec<Hit
     hits
 }
 
+#[tauri::command]
+async fn search_memory(app: AppHandle, query: String, limit: Option<usize>) -> Vec<Hit> {
+    search_hits(&app, &query, limit)
+}
+
 /// 直接给模型用的那段文本（docs §7 的固定格式）。
 /// 没有相关记忆时返回空串——没记忆也塞一段提示词是在浪费 token
+fn context_for(app: &AppHandle, query: &str) -> String {
+    memory::render_context(&search_hits(app, query, None))
+}
+
 #[tauri::command]
-fn memory_context(app: AppHandle, query: String) -> String {
-    memory::render_context(&search_memory(app, query, None))
+async fn memory_context(app: AppHandle, query: String) -> String {
+    context_for(&app, &query)
 }
 
 /// 面板要看的：全部记忆，含归档和已删除的（那是审计）
@@ -793,7 +802,7 @@ fn memory_command(app: AppHandle, text: String) -> Option<String> {
                 format!("我记得这些：\n{}", lines.join("\n"))
             }
         }
-        Command::Pin { query } => match search_memory(app.clone(), query, Some(1)).first() {
+        Command::Pin { query } => match search_hits(&app, &query, Some(1)).first() {
             Some(h) => {
                 pin_memory(app, h.item.id.clone(), true);
                 format!("好，「{}」我一直记着。", h.item.content)
@@ -801,7 +810,7 @@ fn memory_command(app: AppHandle, text: String) -> Option<String> {
             None => "没找到你说的那条。".into(),
         },
         // 「别再根据这条回答」= 归档，不是删。用户想彻底删会说「忘记」
-        Command::Mute { query } => match search_memory(app.clone(), query, Some(1)).first() {
+        Command::Mute { query } => match search_hits(&app, &query, Some(1)).first() {
             Some(h) => {
                 set_memory_status(app, h.item.id.clone(), "archived".into());
                 format!("好，「{}」我不拿来回答了。", h.item.content)
@@ -966,14 +975,14 @@ fn execute(app: &AppHandle, call: &ToolCall) -> ToolResult {
                 return ToolResult::err(id, "invalid_input", "缺 query");
             };
             let limit = call.input.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
-            let hits = search_memory(app.clone(), q, limit);
+            let hits = search_hits(&app, &q, limit);
             ToolResult::ok(id, serde_json::to_value(hits).unwrap_or_default())
         }
         "memory_context" => {
             let Some(q) = arg("query") else {
                 return ToolResult::err(id, "invalid_input", "缺 query");
             };
-            ToolResult::ok(id, serde_json::json!({ "context": memory_context(app.clone(), q) }))
+            ToolResult::ok(id, serde_json::json!({ "context": context_for(&app, &q) }))
         }
         "pin_memory" => {
             let Some(mid) = arg("id") else {
@@ -1161,20 +1170,65 @@ fn open_panel(app: &AppHandle) {
     }
 }
 
+/// 在命令里建窗口必须走 async 命令：同步命令跑在主线程的 IPC 回调里，
+/// Windows 上 WebView2 建窗会等主线程泵消息，直接死锁（Tauri 文档 WebviewWindowBuilder 的已知问题）
+#[tauri::command]
+async fn open_settings_panel(app: AppHandle) {
+    open_panel(&app);
+}
+
+#[tauri::command]
+async fn open_chat(app: AppHandle) -> Result<(), String> {
+    open_chat_window(&app)
+}
+
+/// 打开对话窗口。已经开着就叫到前台，不重复开。托盘 / 快捷键也走这里
+fn open_chat_window(app: &AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window(CHAT_WINDOW) {
+        window.show().map_err(|e| e.to_string())?;
+        window.unminimize().map_err(|e| e.to_string())?;
+        return window.set_focus().map_err(|e| e.to_string());
+    }
+    tauri::WebviewWindowBuilder::new(app, CHAT_WINDOW, tauri::WebviewUrl::App("chat.html".into()))
+        .title("VPet · 和她聊聊")
+        .inner_size(460.0, 700.0)
+        .min_inner_size(380.0, 500.0)
+        .resizable(true)
+        .build()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Clone, serde::Serialize)]
+struct GiftReceived {
+    id: String,
+    name: String,
+    say: String,
+}
+
+#[tauri::command]
+fn list_gifts(shelf: State<'_, RwLock<FoodShelf>>) -> Result<Vec<FoodItem>, String> {
+    shelf.read().map(|s| s.gifts()).map_err(|_| "礼物货架正忙，请稍后再试".into())
+}
+
 /// 用户送她一样礼物。随机挑一件——拆盲盒比让人从二十项里选更有意思。
 /// 礼物不花她的钱，钱是用户出的。
 #[tauri::command]
-fn give_gift(app: AppHandle) -> Option<String> {
+fn give_gift(app: AppHandle, id: Option<String>) -> Result<String, String> {
     let shelf = app.state::<RwLock<FoodShelf>>();
     let picked = {
-        let Ok(s) = shelf.read() else { return None };
-        s.random("gift", now_ms() as u64)
-            .map(|f| (f.id.clone(), f.name.clone()))
+        let s = shelf.read().map_err(|_| "礼物货架正忙，请稍后再试")?;
+        let item = match id.as_deref() {
+            Some(id) => s.get(id).filter(|f| f.graph == "gift" && f.kind == "Gift"),
+            None => s.random("gift", now_ms() as u64),
+        };
+        item.map(|f| (f.id.clone(), f.name.clone()))
     };
-    let (id, name) = picked?;
+    let (id, name) = picked.ok_or("没有找到这件礼物，请刷新礼物列表")?;
     log::info!("收到礼物：{name}");
-    apply(&app, &Event::Gifted { id, name: name.clone() });
-    Some(name)
+    apply(&app, &Event::Gifted { id: id.clone(), name: name.clone() });
+    let _ = app.emit("pet:gift", GiftReceived { id, name: name.clone(), say: format!("送给我的「{name}」吗？谢谢你，我很喜欢！") });
+    Ok(name)
 }
 
 /// Body 启动时把食物目录交给 Core。
@@ -1211,6 +1265,25 @@ fn set_hit_test_pinned(hit: State<'_, Mutex<HitState>>, pinned: bool) {
     }
 }
 
+#[tauri::command]
+fn begin_pet_drag(hit: State<'_, Mutex<HitState>>, anchor_x: f64, anchor_y: f64) -> Result<(), String> {
+    if !anchor_x.is_finite() || !anchor_y.is_finite() {
+        return Err("拖动坐标无效".into());
+    }
+    let mut hit = hit.lock().map_err(|_| "无法开始拖动")?;
+    hit.pinned = true;
+    hit.drag_anchor = Some((anchor_x.clamp(0.0, 500.0), anchor_y.clamp(0.0, 500.0)));
+    Ok(())
+}
+
+#[tauri::command]
+fn end_pet_drag(hit: State<'_, Mutex<HitState>>) {
+    if let Ok(mut hit) = hit.lock() {
+        hit.drag_anchor = None;
+        hit.pinned = false;
+    }
+}
+
 pub fn run() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -1222,7 +1295,7 @@ pub fn run() {
             let cat = Catalog::load();
             // 再把上次的状态读回来（含关掉期间的补算），然后让心跳接手
             // 食物目录要等 Body 推过来，这之前货架是空的（买不起就退回动作表自带的量）
-            let shelf = FoodShelf::default();
+            let shelf = FoodShelf::bundled();
             let restored = restore_state(app.handle(), &cat, &shelf);
             app.manage(cat);
             app.manage(RwLock::new(shelf));
@@ -1241,7 +1314,12 @@ pub fn run() {
             app.manage(Mutex::new(restored));
             app.manage(RwLock::new(EmbedSlot::default()));
             app.manage(RwLock::new(EmbedState::Disabled { reason: "还没开始加载".into() }));
+            let desktop = desktop_settings::init(app.handle());
+            if let Err(e) = chat::init(app.handle()) {
+                log::error!("对话初始化失败: {e}");
+            }
             if let Some(win) = app.get_webview_window(PET_WINDOW) {
+                desktop.apply(&win)?;
                 place_bottom_right(&win);
             }
             build_tray(app.handle())?;
@@ -1263,8 +1341,23 @@ pub fn run() {
             debug_patch_pet_state,
             set_hit_mask,
             set_hit_test_pinned,
+            begin_pet_drag,
+            end_pet_drag,
+            open_chat,
+            open_settings_panel,
+            desktop_settings::get_desktop_settings,
+            desktop_settings::set_desktop_settings,
+            chat::get_chat_settings,
+            chat::save_chat_settings,
+            chat::list_chat_messages,
+            chat::send_chat_message,
+            chat::cancel_chat,
+            chat::rate_chat_message,
+            chat::export_training_data,
+            chat::get_model_status,
             set_food_catalog,
             give_gift,
+            list_gifts,
             create_timer,
             cancel_timer,
             list_timers,
@@ -1329,9 +1422,10 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     // 穿透在 Windows 上是有坑的一项（docs/07 风险表），留个能当场关掉的开关
     let passthrough = CheckMenuItem::with_id(app, "passthrough", "鼠标穿透", true, true, None::<&str>)?;
     let panel = MenuItem::with_id(app, "panel", "面板", true, None::<&str>)?;
+    let chat = MenuItem::with_id(app, "chat", "和她聊聊…", true, None::<&str>)?;
     let gift = MenuItem::with_id(app, "gift", "送她礼物", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&toggle, &panel, &gift, &passthrough, &quit])?;
+    let menu = Menu::with_items(app, &[&toggle, &chat, &panel, &gift, &passthrough, &quit])?;
 
     let mut builder = TrayIconBuilder::with_id("main")
         .menu(&menu)
@@ -1340,8 +1434,11 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         .on_menu_event(|app, event| match event.id().as_ref() {
             "toggle" => toggle_pet(app),
             "panel" => open_panel(app),
+            "chat" => {
+                if let Err(e) = open_chat_window(app) { log::warn!("打开对话窗口失败：{e}"); }
+            }
             "gift" => {
-                give_gift(app.clone());
+                if let Err(e) = give_gift(app.clone(), None) { log::warn!("送礼失败：{e}"); }
             }
             "passthrough" => toggle_passthrough(app),
             "quit" => app.exit(0),
@@ -1374,6 +1471,8 @@ fn spawn_hit_test(app: AppHandle) {
         std::thread::sleep(POLL);
         let Some(win) = app.get_webview_window(PET_WINDOW) else { continue };
 
+        advance_pet_drag(&app, &win);
+
         let ignore = match should_ignore(&app, &win) {
             Ok(v) => v,
             // 读不到光标 / 窗口位置就退到不穿透，别把宠物锁死
@@ -1396,6 +1495,49 @@ fn spawn_hit_test(app: AppHandle) {
     });
 }
 
+/// Read the physical cursor once and derive an absolute window position. Relative
+/// moves from the WebView raced with each other and mixed artwork px with DPI px.
+fn advance_pet_drag(app: &AppHandle, win: &WebviewWindow) {
+    // 拿锁只为读 / 清锚点，读完立刻放：窗口 getter 要等主线程回话，
+    // 而主线程的 set_hit_mask 等命令也要这把锁——抱着锁等主线程就是死锁
+    let anchor = {
+        let hit = app.state::<Mutex<HitState>>();
+        let Ok(mut state) = hit.lock() else { return };
+        let Some(anchor) = state.drag_anchor else { return };
+        if !primary_button_held() {
+            state.drag_anchor = None;
+            state.pinned = false;
+            None
+        } else {
+            Some(anchor)
+        }
+    };
+    let Some(anchor) = anchor else {
+        let _ = app.emit("pet:drag-ended", ());
+        return;
+    };
+    let (Ok(cursor), Ok(size)) = (app.cursor_position(), win.inner_size()) else { return };
+    let target = drag_position((cursor.x, cursor.y), (size.width, size.height), anchor);
+    let _ = win.set_position(PhysicalPosition::new(target.0, target.1));
+}
+
+fn drag_position(cursor: (f64, f64), size: (u32, u32), anchor: (f64, f64)) -> (i32, i32) {
+    ((cursor.0 - anchor.0 / PET_LOGICAL_SIZE * size.0 as f64).round() as i32,
+     (cursor.1 - anchor.1 / PET_LOGICAL_SIZE * size.1 as f64).round() as i32)
+}
+
+#[cfg(target_os = "windows")]
+fn primary_button_held() -> bool {
+    #[link(name = "user32")]
+    extern "system" { fn GetAsyncKeyState(vkey: i32) -> i16; }
+    // Only the high bit indicates the current held state. This also recovers
+    // when release happens outside the WebView or pointer capture is lost.
+    unsafe { GetAsyncKeyState(0x01) < 0 }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn primary_button_held() -> bool { true }
+
 fn should_ignore(app: &AppHandle, win: &WebviewWindow) -> Result<bool, String> {
     {
         let hit = app.state::<Mutex<HitState>>();
@@ -1406,10 +1548,10 @@ fn should_ignore(app: &AppHandle, win: &WebviewWindow) -> Result<bool, String> {
     }
     let cursor = app.cursor_position().map_err(|e| e.to_string())?;
     let origin = win.outer_position().map_err(|e| e.to_string())?;
-    let scale = win.scale_factor().map_err(|e| e.to_string())?;
-    // 物理像素 → 窗口内的逻辑坐标（窗口就是 500×500 逻辑像素，与掩码同一套参考系）
-    let x = (cursor.x - origin.x as f64) / scale;
-    let y = (cursor.y - origin.y as f64) / scale;
+    let size = win.inner_size().map_err(|e| e.to_string())?;
+    // Physical position → 500px artwork reference; works at every pet size and monitor DPI.
+    let x = (cursor.x - origin.x as f64) / size.width.max(1) as f64 * PET_LOGICAL_SIZE;
+    let y = (cursor.y - origin.y as f64) / size.height.max(1) as f64 * PET_LOGICAL_SIZE;
 
     let hit = app.state::<Mutex<HitState>>();
     let st = hit.lock().map_err(|_| "命中状态被污染")?;
@@ -1426,11 +1568,7 @@ fn register_prompt_shortcut(app: &AppHandle) -> Result<(), Box<dyn std::error::E
         if event.state() != ShortcutState::Pressed {
             return;
         }
-        if let Some(w) = app.get_webview_window(PET_WINDOW) {
-            let _ = w.show();
-            let _ = w.set_focus();
-        }
-        let _ = app.emit("pet:prompt", ());
+        if let Err(e) = open_chat_window(app) { log::warn!("打开对话窗口失败：{e}"); }
     })?;
     Ok(())
 }
@@ -1456,5 +1594,27 @@ fn toggle_pet(app: &AppHandle) {
     } else {
         let _ = w.show();
         let _ = w.set_focus();
+    }
+}
+
+#[cfg(test)]
+mod desktop_tests {
+    use super::*;
+
+    #[test]
+    fn drag_keeps_original_grab_offset_at_any_scale_and_negative_monitor_position() {
+        assert_eq!(drag_position((700.0, 500.0), (500, 500), (250.0, 100.0)), (450, 400));
+        assert_eq!(drag_position((700.0, 500.0), (1000, 1000), (250.0, 100.0)), (200, 300));
+        assert_eq!(drag_position((-700.0, -500.0), (200, 200), (250.0, 100.0)), (-800, -540));
+    }
+
+    #[test]
+    fn hit_mask_rejects_negative_coordinates_instead_of_truncating_into_first_cell() {
+        let hit = HitState { mask: Some(vec![255; 288]), ..Default::default() };
+        assert!(!hit.opaque_at(-0.01, 100.0));
+        assert!(!hit.opaque_at(100.0, -0.01));
+        assert!(!hit.opaque_at(500.0, 100.0));
+        assert!(hit.opaque_at(0.0, 100.0));
+        assert!(hit.opaque_at(499.99, 499.99));
     }
 }

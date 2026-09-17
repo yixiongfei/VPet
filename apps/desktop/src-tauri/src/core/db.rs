@@ -592,6 +592,35 @@ mod tests {
         assert!(hits[2].1 < 0.1, "正交的余弦该接近 0：{}", hits[2].1);
     }
 
+    /// 真向量走一遍整条链：Ollama 算 → 存进 sqlite-vec → 近邻查回来。
+    /// 这是「作息」这种没有共同字的查询能否召回的实证，不是单元测试能替代的：
+    ///   cargo test -- --ignored 语义链路
+    #[test]
+    #[ignore = "需要本机 Ollama 运行且已 pull qwen3-embedding:0.6b"]
+    fn 语义链路_ollama向量进索引后能按意思召回() {
+        use crate::core::embed::{ollama, EmbedBackend, OllamaEmbedder};
+        let e = OllamaEmbedder::connect("http://127.0.0.1:11434", &ollama::model_name())
+            .unwrap_or_else(|err| panic!("{}", err.message()));
+        let db = Db::open_in_memory().unwrap();
+        assert!(db.ensure_vec_table(e.dim(), e.version()).unwrap());
+        let docs = [
+            ("m1", "用户晚上上班，白天在家学习"),
+            ("m2", "用户喜欢喝无糖的冰美式"),
+            ("m3", "用户的猫叫团子，三岁"),
+        ];
+        let vecs = e.embed_batch(&docs.map(|(_, t)| t)).unwrap();
+        for ((id, text), v) in docs.iter().zip(vecs) {
+            db.put_memory(&mem(id, text)).unwrap();
+            db.put_embedding(id, &v, e.version()).unwrap();
+        }
+        assert!(db.memories_needing_embedding(e.version()).unwrap().is_empty(), "全算过了，不该还有待补算");
+        for (query, expect) in [("作息", "m1"), ("咖啡", "m2"), ("宠物", "m3")] {
+            let hits = db.knn(&e.embed_query(query).unwrap(), 3).unwrap();
+            eprintln!("「{query}」→ {hits:?}");
+            assert_eq!(hits[0].0, expect, "「{query}」没召回该召回的那条：{hits:?}");
+        }
+    }
+
     #[test]
     fn 换模型或换维度会整张重建并清空版本号() {
         let db = Db::open_in_memory().unwrap();

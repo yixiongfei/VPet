@@ -8,6 +8,14 @@
 //! `xᵀ M y`，区别只在 M：字面法是 `M = I`（符号两两正交），embedding 是
 //! `M = WᵀW`（W 是学出来的低秩投影，非对角元素就是符号之间的语义相关性）。
 //!
+//! 两个后端，同一个 [`EmbedBackend`] 接口：
+//!
+//! - **Ollama（默认）**：向量由本机 Ollama 的 `/api/embed` 算，和对话模型共用同一个
+//!   运行时（CPU / Vulkan GPU 都归它管）。编译期零下载、零原生依赖，
+//!   `qwen3-embedding:0.6b` 一条 `ollama pull` 就绪。
+//! - **ONNX（`embed` feature，可选）**：本地目录里的 `model.onnx`，完全不依赖 Ollama。
+//!   ORT 二进制在有些机器上下载不下来，所以不再是默认。
+//!
 //! 工程上的四条取舍：
 //!
 //! 1. **不用 `fastembed`，直接用 `ort` + `tokenizers`。** fastembed 会把
@@ -81,6 +89,200 @@ pub fn model_dir(app_data: &Path) -> PathBuf {
 pub fn looks_ready(dir: &Path) -> bool {
     dir.join("model.onnx").is_file() && dir.join("tokenizer.json").is_file()
 }
+
+/// lib.rs 只认这个接口，不关心向量是 ORT 还是 Ollama 算出来的。
+/// 所有方法都是同步阻塞的——调用方自己决定放不放后台线程
+pub trait EmbedBackend: Send + Sync {
+    fn dim(&self) -> usize;
+    /// 写进 `memory_items.embedding_version`：换后端 / 换模型都会让旧向量作废并触发补算
+    fn version(&self) -> &str;
+    fn embed_query(&self, q: &str) -> Result<Vec<f32>, String>;
+    fn embed_one(&self, text: &str) -> Result<Vec<f32>, String>;
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, String>;
+}
+
+/// L2 归一化。归一化之后余弦就等于内积，向量索引那边也能直接用
+/// `distance_metric=cosine`，两边的度量才是同一个
+pub fn normalize(mut v: Vec<f32>) -> Vec<f32> {
+    let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if n > 1e-12 {
+        for x in v.iter_mut() {
+            *x /= n;
+        }
+    }
+    v
+}
+
+/* ==================== Ollama 后端 ==================== */
+
+pub mod ollama {
+    use super::{normalize, EmbedBackend};
+    use std::time::Duration;
+
+    /// 多语言、1024 维、六百多 MB。中文检索比 nomic 稳，比 bge-m3 小一半
+    pub const DEFAULT_MODEL: &str = "qwen3-embedding:0.6b";
+
+    /// 环境变量 `VPET_EMBED_OLLAMA_MODEL` 可以换成 Ollama 里任何 embedding 模型
+    pub fn model_name() -> String {
+        std::env::var("VPET_EMBED_OLLAMA_MODEL")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string())
+    }
+
+    /// 接不上和没装模型是两种病：前者等一等再试（Ollama 可能比桌宠晚几秒起来），
+    /// 后者再等也没用，得告诉用户去 pull
+    #[derive(Debug)]
+    pub enum ConnectError {
+        Unreachable(String),
+        MissingModel(String),
+        Other(String),
+    }
+
+    impl ConnectError {
+        pub fn message(&self) -> &str {
+            match self {
+                Self::Unreachable(m) | Self::MissingModel(m) | Self::Other(m) => m,
+            }
+        }
+    }
+
+    pub struct OllamaEmbedder {
+        agent: ureq::Agent,
+        endpoint: String,
+        model: String,
+        version: String,
+        dim: usize,
+        query_prefix: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Tags {
+        #[serde(default)]
+        models: Vec<TagModel>,
+    }
+    #[derive(serde::Deserialize)]
+    struct TagModel {
+        name: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct EmbedResponse {
+        #[serde(default)]
+        embeddings: Vec<Vec<f32>>,
+        #[serde(default)]
+        error: Option<String>,
+    }
+
+    impl OllamaEmbedder {
+        /// 探一次模型列表 + 真算一句话把维度问出来。`endpoint` 形如 `http://127.0.0.1:11434`
+        pub fn connect(endpoint: &str, model: &str) -> Result<Self, ConnectError> {
+            let agent: ureq::Agent = ureq::Agent::config_builder()
+                .timeout_global(Some(Duration::from_secs(90)))
+                .http_status_as_error(false)
+                .proxy(None) // 本机地址，绝不走系统代理
+                .build()
+                .into();
+            let endpoint = endpoint.trim_end_matches('/').to_string();
+            let tags: Tags = agent
+                .get(format!("{endpoint}/api/tags"))
+                .call()
+                .map_err(|e| ConnectError::Unreachable(format!("连不上 Ollama（{endpoint}）：{e}")))?
+                .body_mut()
+                .read_json()
+                .map_err(|e| ConnectError::Other(format!("Ollama 模型列表读不懂：{e}")))?;
+            let installed = tags.models.iter().any(|m| {
+                m.name == model || m.name == format!("{model}:latest") || format!("{}:latest", m.name) == model
+            });
+            if !installed {
+                return Err(ConnectError::MissingModel(format!(
+                    "Ollama 里没有 {model}。运行一次 `ollama pull {model}`（约 640 MB）即可，或用 VPET_EMBED_OLLAMA_MODEL 指定别的 embedding 模型"
+                )));
+            }
+            // 查询侧的指令前缀：qwen3-embedding / nomic 都是这么训练的，不加会掉点；文档侧不加
+            let lower = model.to_ascii_lowercase();
+            let query_prefix = if lower.starts_with("qwen3-embedding") {
+                "Instruct: 根据这句话找出相关的记忆\nQuery: ".to_string()
+            } else if lower.starts_with("nomic-embed") {
+                "search_query: ".to_string()
+            } else {
+                String::new()
+            };
+            let mut me = Self {
+                agent,
+                endpoint,
+                model: model.to_string(),
+                version: format!("ollama:{model}"),
+                dim: 0,
+                query_prefix,
+            };
+            let probe = me.embed(&["维度探测"]).map_err(ConnectError::Other)?;
+            let dim = probe.first().map(|v| v.len()).unwrap_or(0);
+            if dim == 0 {
+                return Err(ConnectError::Other(format!("{model} 返回的向量是空的，它可能不是 embedding 模型")));
+            }
+            me.dim = dim;
+            Ok(me)
+        }
+
+        pub fn model(&self) -> &str {
+            &self.model
+        }
+
+        fn embed(&self, inputs: &[&str]) -> Result<Vec<Vec<f32>>, String> {
+            if inputs.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut resp = self
+                .agent
+                .post(format!("{}/api/embed", self.endpoint))
+                .send_json(serde_json::json!({
+                    "model": self.model,
+                    "input": inputs,
+                    "truncate": true,
+                    // 记忆写入是零星的，让模型在显存里多待一会儿，别每次都冷启动
+                    "keep_alive": "30m",
+                }))
+                .map_err(|e| format!("Ollama embedding 请求失败：{e}"))?;
+            let status = resp.status();
+            let body: EmbedResponse = resp
+                .body_mut()
+                .read_json()
+                .map_err(|e| format!("Ollama embedding 响应读不懂（HTTP {status}）：{e}"))?;
+            if let Some(err) = body.error {
+                return Err(format!("Ollama：{err}"));
+            }
+            if !status.is_success() {
+                return Err(format!("Ollama embedding 返回 HTTP {status}"));
+            }
+            if body.embeddings.len() != inputs.len() {
+                return Err(format!("要 {} 条向量，Ollama 给了 {} 条", inputs.len(), body.embeddings.len()));
+            }
+            Ok(body.embeddings.into_iter().map(normalize).collect())
+        }
+    }
+
+    impl EmbedBackend for OllamaEmbedder {
+        fn dim(&self) -> usize {
+            self.dim
+        }
+        fn version(&self) -> &str {
+            &self.version
+        }
+        fn embed_query(&self, q: &str) -> Result<Vec<f32>, String> {
+            let text = format!("{}{}", self.query_prefix, q);
+            Ok(self.embed(&[&text])?.into_iter().next().unwrap_or_default())
+        }
+        fn embed_one(&self, text: &str) -> Result<Vec<f32>, String> {
+            Ok(self.embed(&[text])?.into_iter().next().unwrap_or_default())
+        }
+        fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
+            self.embed(texts)
+        }
+    }
+}
+
+pub use ollama::OllamaEmbedder;
 
 /* ==================== 以下要 ONNX 才编得出来 ==================== */
 
@@ -300,16 +502,22 @@ mod onnx {
         }
     }
 
-    /// L2 归一化。归一化之后余弦就等于内积，向量索引那边也能直接用
-    /// `distance_metric=cosine`，两边的度量才是同一个
-    fn normalize(mut v: Vec<f32>) -> Vec<f32> {
-        let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if n > 1e-12 {
-            for x in v.iter_mut() {
-                *x /= n;
-            }
+    impl EmbedBackend for Embedder {
+        fn dim(&self) -> usize {
+            Embedder::dim(self)
         }
-        v
+        fn version(&self) -> &str {
+            Embedder::version(self)
+        }
+        fn embed_query(&self, q: &str) -> Result<Vec<f32>, String> {
+            Embedder::embed_query(self, q)
+        }
+        fn embed_one(&self, text: &str) -> Result<Vec<f32>, String> {
+            Embedder::embed_one(self, text)
+        }
+        fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
+            Embedder::embed_batch(self, texts)
+        }
     }
 }
 
@@ -342,6 +550,42 @@ mod tests {
         assert!((cosine(&[1.0, 0.0], &[-1.0, 0.0]) + 1.0).abs() < 1e-6);
         assert_eq!(cosine(&[1.0], &[1.0, 2.0]), 0.0, "维度不同应当直接判 0");
         assert_eq!(cosine(&[0.0, 0.0], &[1.0, 1.0]), 0.0, "零向量不该算出 NaN");
+    }
+
+    #[test]
+    fn 归一化后模是一() {
+        let v = normalize(vec![3.0, 4.0]);
+        assert!((v[0] - 0.6).abs() < 1e-6 && (v[1] - 0.8).abs() < 1e-6);
+        assert_eq!(normalize(vec![0.0, 0.0]), vec![0.0, 0.0], "零向量不该除出 NaN");
+    }
+
+    #[test]
+    fn 环境变量能换_ollama_模型名() {
+        // 不改全局环境：只验证默认值本身是个合法的 Ollama 模型名
+        let m = ollama::model_name();
+        assert!(!m.is_empty() && !m.contains(char::is_whitespace));
+    }
+
+    /// 真打到本机 Ollama。没装模型 / 没起服务就跳过，不算失败：
+    ///   cargo test -- --ignored ollama_embedding
+    #[test]
+    #[ignore = "需要本机 Ollama 运行且已 pull qwen3-embedding:0.6b"]
+    fn ollama_embedding_live() {
+        let e = match OllamaEmbedder::connect("http://127.0.0.1:11434", &ollama::model_name()) {
+            Ok(e) => e,
+            Err(err) => panic!("{}", err.message()),
+        };
+        assert!(e.dim() >= 256, "维度太小：{}", e.dim());
+        let a = e.embed_one("我晚上工作，白天学习").unwrap();
+        let b = e.embed_query("作息").unwrap();
+        let c = e.embed_one("番茄炒蛋要先炒蛋").unwrap();
+        assert_eq!(a.len(), e.dim());
+        let n: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((n - 1.0).abs() < 1e-3, "没归一化，模是 {n}");
+        assert!(cosine(&a, &b) > cosine(&c, &b), "语义没对上：作息 vs 作息句 {} / 菜谱 {}", cosine(&a, &b), cosine(&c, &b));
+        let batch = e.embed_batch(&["我", "我晚上工作白天学习考研"]).unwrap();
+        assert_eq!(batch.len(), 2);
+        eprintln!("模型 {} · {} 维 · 作息句 {:.3} / 菜谱 {:.3}", e.model(), e.dim(), cosine(&a, &b), cosine(&c, &b));
     }
 
     #[test]

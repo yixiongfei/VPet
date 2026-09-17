@@ -22,6 +22,7 @@ export default defineConfig({
       input: {
         main: fileURLToPath(new URL('./index.html', import.meta.url)),
         panel: fileURLToPath(new URL('./panel.html', import.meta.url)),
+        chat: fileURLToPath(new URL('./chat.html', import.meta.url)),
       },
     },
     target: process.env.TAURI_ENV_PLATFORM === 'windows' ? 'chrome105' : 'safari13',

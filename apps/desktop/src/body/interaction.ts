@@ -2,11 +2,12 @@ import type { GraphType, Manifest, PetProfile, PetState } from '@vpet/shared'
 import type { AnimationPlayer } from './AnimationPlayer'
 import { namesFor, pick } from './manifest'
 import { CLIP_FOR, DEFAULT_PET_STATE } from './petState'
-import { moveWindowBy, setHitTestPinned } from './petWindow'
-import { clickZone, pressZone, type ClickZone } from './touch'
+import { beginPetDrag, endPetDrag, setHitTestPinned } from './petWindow'
+import { clickZone, type ClickZone } from './touch'
 
 /** 按住多久算长按（原版 Setting.PressLength，默认 0.5s） */
 const PRESS_MS = 500
+const DRAG_THRESHOLD_PX = 6
 /** 空闲多久随机播一个小动作 */
 const IDLE_ACTION_EVERY_MS: [number, number] = [15_000, 40_000]
 /** 提起后先挣扎几次再转静止（原版 rasetype 0→2，共 3 次 Raised_Dynamic） */
@@ -18,6 +19,8 @@ export interface InteractionOpts {
   profile: PetProfile
   /** 交互发生时通知外部；Phase 2 起转给 Core 的状态机改体力/心情 */
   onTouch?: (zone: ClickZone | 'raise') => void
+  onClick?: () => void
+  onDragChange?: (dragging: boolean) => void
 }
 
 /**
@@ -36,11 +39,10 @@ export class Interaction {
   private idleTimer = 0
   private pressTimer = 0
   private lastAt: { x: number; y: number } | null = null
+  private pressAt: { x: number; y: number; screenX: number; screenY: number } | null = null
   private struggles = 0
   private released = false
   private raiseName = 'raise'
-  private followRaf = 0
-  private pendingFollow: { dx: number; dy: number } | null = null
   private pinned = false
   private disposed = false
 
@@ -90,14 +92,15 @@ export class Interaction {
     this.disposed = true
     window.clearTimeout(this.idleTimer)
     window.clearTimeout(this.pressTimer)
-    cancelAnimationFrame(this.followRaf)
+    endPetDrag()
     this.o.player.onIdle = null
     if (this.pinned) void setHitTestPinned(false)
   }
 
-  onPointerDown(x: number, y: number): void {
+  onPointerDown(x: number, y: number, screenX = x, screenY = y): void {
     if (this.disposed || this.mode === 'raised') return
     this.lastAt = { x, y }
+    this.pressAt = { x, y, screenX, screenY }
     this.setPinned(true) // 按下期间别让穿透判定把窗口切走
     window.clearTimeout(this.idleTimer)
     window.clearTimeout(this.pressTimer)
@@ -105,27 +108,39 @@ export class Interaction {
       this.pressTimer = 0
       const at = this.lastAt
       if (this.disposed || !at) return
-      if (pressZone(this.o.profile, this.state.mood, at.x, at.y)) this.raise(at.x, at.y)
+      this.raise()
     }, PRESS_MS)
   }
 
-  onPointerMove(x: number, y: number): void {
+  onPointerMove(x: number, y: number, screenX = x, screenY = y): void {
     if (this.disposed) return
     this.lastAt = { x, y }
-    if (this.mode === 'raised') this.scheduleFollow(x, y)
+    if (this.pressAt && this.mode !== 'raised' &&
+      Math.hypot(screenX - this.pressAt.screenX, screenY - this.pressAt.screenY) >= DRAG_THRESHOLD_PX) {
+      window.clearTimeout(this.pressTimer)
+      this.pressTimer = 0
+      this.raise()
+    }
   }
 
-  onPointerUp(): void {
-    if (this.disposed) return
-    const wasShortPress = this.pressTimer !== 0
+  onPointerUp(cancelled = false): void {
+    if (this.disposed || !this.pressAt) return
+    const wasShortPress = this.pressTimer !== 0 && !cancelled
     window.clearTimeout(this.pressTimer)
     this.pressTimer = 0
+    this.pressAt = null
+    endPetDrag()
+    this.setPinned(false)
 
     if (this.mode === 'raised') {
       this.released = true // 等当前段播完再落地，落地后 toActivity 解钉
+      this.o.onDragChange?.(false)
       return
     }
-    if (!wasShortPress) return // 长按已经处理过了
+    if (!wasShortPress) {
+      this.scheduleIdleAction()
+      return
+    }
 
     const at = this.lastAt
     const zone = at && clickZone(this.o.profile, at.x, at.y)
@@ -134,6 +149,7 @@ export class Interaction {
       this.setPinned(false)
       this.scheduleIdleAction() // 点在空白处：恢复空闲计时
     }
+    this.o.onClick?.()
   }
 
   /* ------------------------------------------------------------ */
@@ -148,7 +164,7 @@ export class Interaction {
   /** 回到当前活动对应的循环动画 */
   private toActivity(): void {
     this.mode = 'idle'
-    this.setPinned(false)
+    if (!this.pressAt) this.setPinned(false)
     const { type, name } = CLIP_FOR[this.state.activity]
     // Core 指名了具体动作就用它的动画（同是 working，文案≠修屏幕），否则用兜底
     const graph = this.state.action?.graph ?? name
@@ -192,7 +208,9 @@ export class Interaction {
     this.o.onTouch?.(zone)
   }
 
-  private raise(x: number, y: number): void {
+  private raise(): void {
+    const anchor = this.pressAt
+    if (!anchor || this.mode === 'raised') return
     this.mode = 'raised'
     this.released = false
     this.struggles = 0
@@ -200,9 +218,10 @@ export class Interaction {
     const names = namesFor(this.o.manifest, 'raised_static', mood)
     this.raiseName = names.length ? pick(names) : 'raise'
     this.o.onTouch?.('raise')
-    // 先把窗口挪到「锚点贴着光标」（原版 DisplayRaised 的位置迁移）
-    const anchor = this.o.profile.raisePoint[mood]
-    void moveWindowBy(x - anchor.x, y - anchor.y)
+    this.o.onDragChange?.(true)
+    // Keep the original grab point. Rust follows the physical cursor directly,
+    // avoiding asynchronous relative-position races and jumps to the head.
+    beginPetDrag(anchor.x, anchor.y)
     this.raiseStep()
   }
 
@@ -228,16 +247,4 @@ export class Interaction {
     void this.o.player.playStep({ type: 'raised_static', name, mood }, 'loop', this.raiseStep)
   }
 
-  /** 提起时窗口跟随光标：光标在窗口内的位置会收敛到 raisePoint，所以偏移量自然趋于 0 */
-  private scheduleFollow(x: number, y: number): void {
-    const anchor = this.o.profile.raisePoint[this.state.mood]
-    this.pendingFollow = { dx: x - anchor.x, dy: y - anchor.y }
-    if (this.followRaf) return
-    this.followRaf = requestAnimationFrame(() => {
-      this.followRaf = 0
-      const f = this.pendingFollow
-      this.pendingFollow = null
-      if (f && this.mode === 'raised' && !this.disposed) void moveWindowBy(f.dx, f.dy)
-    })
-  }
 }

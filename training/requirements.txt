@@ -1,0 +1,6 @@
+# Install in an isolated Python 3.11/3.12 venv. Inference uses Ollama, not these.
+torch>=2.6,<3
+transformers>=4.51,<5
+peft>=0.15,<1
+accelerate>=1.6,<2
+safetensors>=0.5

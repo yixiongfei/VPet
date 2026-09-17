@@ -15,9 +15,11 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [features]
-default = ["embed"]
-# 语义检索。ORT 在编译期下载并静态链接——发布版走这条，用户不用额外装东西
-embed = ["_onnx", "ort/download-binaries"]
+# 语义检索默认走本机 Ollama 的 /api/embed（core/embed.rs），编译期零下载。
+# 下面两个 feature 是可选的本地 ONNX 后端：目录里有 model.onnx 时优先用它
+default = []
+# ORT 在编译期下载并静态链接。有些机器（代理 / 跨盘临时目录）下不下来，所以不是默认
+embed = ["_onnx", "ort/download-binaries", "ort/tls-native"]
 # 同上，但 ORT 在运行期从 ORT_DYLIB_PATH 动态加载。
 # 编译期零下载，所以 CI / 离线环境用这条验证：
 #   cargo test --no-default-features --features embed-dynamic
@@ -36,6 +38,11 @@ env_logger = "0.11"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 toml = "1.1.6"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+# Local Ollama transport. No proxy, redirects or remote endpoints are allowed by chat.rs.
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "stream"] }
+# 同步的本机 HTTP，给 embedding 用：它要能从任何线程（含主线程、tokio 线程）阻塞调用
+ureq = { version = "3.4", default-features = false, features = ["json"] }
+tokio = { version = "1", features = ["macros", "sync", "time"] }
 # 向量索引。只是加速器——真相在 memory_items 表里，这张表随时能重建
 sqlite-vec = "0.1.9"
 bytemuck = "1"

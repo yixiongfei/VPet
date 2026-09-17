@@ -7,6 +7,9 @@
   "scripts": {
     "build:assets": "node scripts/build-assets.mjs",
     "dev": "pnpm --filter @vpet/desktop tauri dev",
+    "dev:onnx": "pnpm --filter @vpet/desktop tauri dev -- --features embed",
+    "build:local": "pnpm --filter @vpet/desktop tauri build --no-bundle",
+    "build:icon": "node scripts/build-icon.mjs && pnpm --filter @vpet/desktop tauri icon public/avatar.png --output src-tauri/icons",
     "build": "pnpm --filter @vpet/desktop tauri build",
     "web": "pnpm --filter @vpet/desktop dev",
     "typecheck": "pnpm -r --if-present typecheck"

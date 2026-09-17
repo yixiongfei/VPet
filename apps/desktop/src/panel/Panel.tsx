@@ -464,7 +464,7 @@ export function Panel() {
               <Btn onClick={() => patch({ affection: 0 })}>好感清零</Btn>
               <Btn onClick={() => patch({ affection: 100 })}>好感拉满</Btn>
               <Btn
-                onClick={() => void invokeCore<string>('give_gift').then((n) => setGift(n ?? '（没货架）'))}
+                onClick={() => void invokeCore<string>('give_gift').then((n) => setGift(n ?? '（送礼失败，看日志）'))}
               >
                 送个礼物
               </Btn>
