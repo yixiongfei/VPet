@@ -13,6 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use core::actions::Catalog;
 use core::db::Db;
 use core::food::{FoodItem, FoodShelf};
+use core::scheduler::{parse_duration, Scheduler, Timer};
 use core::state_machine::{catch_up, reduce, Event, Pet, PetState, Touch};
 
 use tauri::{
@@ -204,12 +205,32 @@ fn spawn_pet_clock(app: AppHandle) {
                 }
                 let _ = app.emit("pet:state", next.state.clone());
             }
+            fire_due_timers(&app);
+
             if last_persist.elapsed() >= PERSIST_EVERY {
                 last_persist = Instant::now();
                 persist(&app, &next);
             }
         }
     });
+}
+
+/// 到点的计时器响一下。跟着心跳走，不另起一套时钟
+fn fire_due_timers(app: &AppHandle) {
+    let fired = {
+        let sched = app.state::<Mutex<Scheduler>>();
+        let Ok(mut sc) = sched.lock() else { return };
+        let due = sc.take_due(now_ms());
+        if due.is_empty() {
+            return;
+        }
+        save_timers(app, &sc);
+        due
+    };
+    for t in fired {
+        log::info!("计时器响了：{}", t.label);
+        let _ = app.emit("timer:fired", &t);
+    }
 }
 
 /// 落一条状态流水。存不进去不该影响宠物继续跑——大不了这次的数值丢了
@@ -258,6 +279,54 @@ fn restore_state(app: &AppHandle, cat: &Catalog, shelf: &FoodShelf) -> Pet {
     };
     app.manage(Mutex::new(db));
     restored
+}
+
+/// 排一个计时器。`duration` 按人写的方式给：`"10s"` `"25m"` `"1h"`
+#[tauri::command]
+fn create_timer(
+    app: AppHandle,
+    duration: String,
+    label: Option<String>,
+    repeat: Option<bool>,
+) -> Result<Timer, String> {
+    let ms = parse_duration(&duration).ok_or_else(|| format!("看不懂的时长：{duration}"))?;
+    let sched = app.state::<Mutex<Scheduler>>();
+    let Ok(mut sc) = sched.lock() else {
+        return Err("调度器被污染".into());
+    };
+    let t = sc.add(
+        label.as_deref().unwrap_or("计时器"),
+        ms,
+        repeat.unwrap_or(false),
+        now_ms(),
+    );
+    log::info!("排了计时器「{}」，{duration} 后响", t.label);
+    save_timers(&app, &sc);
+    Ok(t)
+}
+
+#[tauri::command]
+fn cancel_timer(app: AppHandle, id: String) -> bool {
+    let sched = app.state::<Mutex<Scheduler>>();
+    let Ok(mut sc) = sched.lock() else { return false };
+    let ok = sc.cancel(&id);
+    if ok {
+        save_timers(&app, &sc);
+    }
+    ok
+}
+
+#[tauri::command]
+fn list_timers(sched: State<'_, Mutex<Scheduler>>) -> Vec<Timer> {
+    sched.lock().map(|s| s.list().to_vec()).unwrap_or_default()
+}
+
+fn save_timers(app: &AppHandle, sc: &Scheduler) {
+    let Some(db) = app.try_state::<Mutex<Db>>() else { return };
+    let Ok(db) = db.lock() else { return };
+    if let Err(e) = db.save_scheduler(sc) {
+        log::warn!("计时器落库失败: {e}");
+    }
 }
 
 /// 打开面板窗口。已经开着就叫到前台，不重复开
@@ -345,6 +414,15 @@ pub fn run() {
             let restored = restore_state(app.handle(), &cat, &shelf);
             app.manage(cat);
             app.manage(RwLock::new(shelf));
+            // 计时器：过期的下一拍就会补发，没到期的接着等
+            let timers = app
+                .try_state::<Mutex<Db>>()
+                .and_then(|db| db.lock().ok().map(|d| d.load_scheduler()))
+                .unwrap_or_default();
+            if !timers.is_empty() {
+                log::info!("读回 {} 个计时器", timers.len());
+            }
+            app.manage(Mutex::new(timers));
             app.manage(Mutex::new(restored));
             if let Some(win) = app.get_webview_window(PET_WINDOW) {
                 place_bottom_right(&win);
@@ -367,7 +445,10 @@ pub fn run() {
             set_hit_mask,
             set_hit_test_pinned,
             set_food_catalog,
-            give_gift
+            give_gift,
+            create_timer,
+            cancel_timer,
+            list_timers
         ])
         .build(tauri::generate_context!())
         .expect("VPet 启动失败")

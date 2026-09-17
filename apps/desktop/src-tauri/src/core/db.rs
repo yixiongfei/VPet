@@ -7,6 +7,7 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension};
 
+use super::scheduler::Scheduler;
 use super::state_machine::Pet;
 
 /// 只能往后追加，**永远不要改已有的条目**——老库已经按旧内容跑过了
@@ -20,6 +21,14 @@ const MIGRATIONS: &[&str] = &[
         state      TEXT    NOT NULL
     );
     CREATE INDEX idx_pet_state_log_time ON pet_state_log(recorded_at DESC);
+    "#,
+    // v2：计时器。整张表就一行 JSON——计时器最多几十个，为它建关系表
+    //（id / label / due_at / repeat 四列 + 增删改查）是过度设计
+    r#"
+    CREATE TABLE kv (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
     "#,
 ];
 
@@ -110,6 +119,40 @@ impl Db {
             }
         }))
     }
+
+    /// 通用键值。目前只放调度器，以后 settings 之类也走这里；
+    /// 真需要按字段查询了再单独建表
+    fn put(&self, key: &str, value: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO kv (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )?;
+        Ok(())
+    }
+
+    fn take(&self, key: &str) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row("SELECT value FROM kv WHERE key = ?1", [key], |r| r.get(0))
+            .optional()
+    }
+
+    pub fn save_scheduler(&self, s: &Scheduler) -> rusqlite::Result<()> {
+        let json = serde_json::to_string(s)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        self.put("scheduler", &json)
+    }
+
+    /// 读回计时器。读不回来就当没有——几个闹钟丢了，不该拦住启动
+    pub fn load_scheduler(&self) -> Scheduler {
+        match self.take("scheduler") {
+            Ok(Some(j)) => serde_json::from_str(&j).unwrap_or_else(|e| {
+                log::warn!("读不回计时器: {e}");
+                Scheduler::default()
+            }),
+            _ => Scheduler::default(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -127,6 +170,25 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn 计时器能存能读() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(db.load_scheduler().is_empty(), "空库不该有计时器");
+        let mut sc = Scheduler::default();
+        sc.add("二十五分钟后叫我", 1_500_000, false, 1_700_000_000_000);
+        db.save_scheduler(&sc).unwrap();
+        let back = db.load_scheduler();
+        assert_eq!(back.list(), sc.list());
+        assert_eq!(back.seq(), sc.seq());
+    }
+
+    #[test]
+    fn 计时器存坏了不拦启动() {
+        let db = Db::open_in_memory().unwrap();
+        db.put("scheduler", "不是json").unwrap();
+        assert!(db.load_scheduler().is_empty());
     }
 
     #[test]

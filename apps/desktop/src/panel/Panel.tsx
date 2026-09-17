@@ -7,14 +7,34 @@ import { Gauge } from './Gauge'
 /** 面板刷新节奏。Core 只在换动作时推事件，数值得自己拉 */
 const REFRESH_MS = 1000
 
+interface TimerRow {
+  id: string
+  label: string
+  dueAt: number
+  repeatMs: number | null
+}
+
+/** 还剩多久。已经过点了就显示「就绪」——下一拍心跳会把它响掉 */
+function remaining(dueAt: number): string {
+  const left = Math.round((dueAt - Date.now()) / 1000)
+  if (left <= 0) return '就绪'
+  if (left < 60) return `${left}s`
+  const m = Math.floor(left / 60)
+  return m < 60 ? `${m}m${left % 60}s` : `${Math.floor(m / 60)}h${m % 60}m`
+}
+
 export function Panel() {
   const [state, setState] = useState<PetState | null>(null)
   const [version, setVersion] = useState('')
   const [gift, setGift] = useState<string | null>(null)
+  const [timers, setTimers] = useState<TimerRow[]>([])
 
   useEffect(() => {
     void invokeCore<string>('app_version').then((v) => v && setVersion(v))
-    const pull = () => void invokeCore<PetState>('get_pet_state').then((s) => s && setState(s))
+    const pull = () => {
+      void invokeCore<PetState>('get_pet_state').then((s) => s && setState(s))
+      void invokeCore<TimerRow[]>('list_timers').then((t) => t && setTimers(t))
+    }
     pull()
     const timer = window.setInterval(pull, REFRESH_MS)
     const stop = subscribePetState(setState)
@@ -25,6 +45,9 @@ export function Panel() {
   }, [])
 
   const patch = (p: Record<string, number>) => void invokeCore('debug_patch_pet_state', p)
+  const pullTimers = () => void invokeCore<TimerRow[]>('list_timers').then((t) => t && setTimers(t))
+  const addTimer = (duration: string, label: string, repeat = false) =>
+    void invokeCore('create_timer', { duration, label, repeat }).then(pullTimers)
 
   return (
     <div style={{ maxWidth: 720, margin: '0 auto', padding: '24px 20px 40px' }}>
@@ -96,6 +119,43 @@ export function Panel() {
               </Btn>
             </Row>
             {gift && <p style={{ color: '#a8d5a2', marginBottom: 0 }}>送出了：{gift}</p>}
+          </Card>
+
+          <Card title="计时器">
+            <p style={{ margin: '0 0 12px', color: '#8a8a93', fontSize: 13 }}>
+              到点她会说一句。杀掉进程重启，没到期的还在。
+            </p>
+            <Row>
+              <Btn onClick={() => addTimer('10s', '十秒到了')}>10 秒后</Btn>
+              <Btn onClick={() => addTimer('25m', '该休息了')}>25 分钟后</Btn>
+              <Btn onClick={() => addTimer('1m', '每分钟提醒', true)}>每分钟</Btn>
+            </Row>
+            {timers.length === 0 ? (
+              <p style={{ color: '#8a8a93', margin: 0, fontSize: 13 }}>还没有计时器</p>
+            ) : (
+              <ul style={{ listStyle: 'none', padding: 0, margin: 0 }}>
+                {timers.map((t) => (
+                  <li
+                    key={t.id}
+                    style={{
+                      display: 'flex', alignItems: 'center', gap: 10,
+                      padding: '6px 0', borderTop: '1px solid #2c2c32',
+                    }}
+                  >
+                    <span style={{ flex: 1 }}>
+                      {t.label}
+                      {t.repeatMs != null && <span style={{ color: '#8a8a93' }}> · 循环</span>}
+                    </span>
+                    <span style={{ color: '#8a8a93', fontVariantNumeric: 'tabular-nums', fontSize: 13 }}>
+                      {remaining(t.dueAt)}
+                    </span>
+                    <Btn onClick={() => void invokeCore('cancel_timer', { id: t.id }).then(pullTimers)}>
+                      取消
+                    </Btn>
+                  </li>
+                ))}
+              </ul>
+            )}
           </Card>
         </>
       )}

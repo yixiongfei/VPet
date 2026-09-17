@@ -54,7 +54,7 @@ Phase 8  打磨与发布            ─  v4
 |---|---|
 | 2.1 SQLite | 🚧 rusqlite bundled + 迁移框架（`user_version` + 只增不改的 SQL 数组，二十行，不引框架）；已建 `pet_state_log`。其余表（`settings` `timers` `pomodoro_sessions` `sessions` `messages` `grants` `audit`）等各自的功能到位时再加——建一堆没人读的空表没有意义 |
 | 2.2 PetStateMachine | ✅ `reduce(state, event)` 纯函数 + 16 个单元测试；秒级 tick 推进体力/心情/饱腹/口渴；饿渴到阈值自动去吃喝。时间从外面以 `Event::Tick { minutes }` 喂进来，所以「四小时后会饿」能在测试里瞬间验证，离线补算也复用同一段代码。`Ill` 要「连续 3 天 PoorCondition」，需要在流水上做跨天统计，留给 Phase 7 的 Mood Engine |
-| 2.3 Scheduler | tokio；一次性 / 周期 / cron；持久化；重启补发 |
+| 2.3 Scheduler | ✅ 一次性 / 周期；持久化在 `kv` 表；重启补发（过期的响一次，周期的下一次从现在起算）。**没用 tokio**——已有每秒一拍的心跳，再起一套调度只是多一个要对齐的时钟；到期判断做成纯函数，时间由外面喂。cron 等到真有按周/按月的需求再说 |
 | 2.4 Pomodoro Engine | 相位机；事件 `pomodoro:tick / phase` |
 | 2.5 ToolRegistry + PermissionGate + AuditLog | 协议见 03 §5–6；内建工具：`start_pomodoro` `stop_pomodoro` `create_timer` `cancel_timer` `get_pet_state` `set_setting` `get_setting` `set_permission` `system_notify` |
 | 2.6 Secrets | `keyring` crate 存 API key；`get_secret` 命令 |

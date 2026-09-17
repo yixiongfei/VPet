@@ -57,6 +57,13 @@ export function PetCanvas() {
         void fetchPetState().then((s) => { if (s && !disposed) interaction.setState(s) })
         // Rust 侧全局快捷键按下时发这个事件（见 src-tauri/src/lib.rs）
         stops.push(subscribe('pet:prompt', () => setInputOpen(true)))
+        // 计时器响了：说一句。Phase 3 起这句话由 Brain 来写
+        stops.push(
+          subscribe('timer:fired', (payload) => {
+            const label = (payload as { label?: string } | null)?.label
+            if (label) announce(`⏰ ${label}`)
+          }),
+        )
         console.info(
           `[VPet] ${profile.name} 载入：${manifest.clips.length} clips · ${manifest.size}px · ${manifest.generatedAt}`,
         )
@@ -71,6 +78,18 @@ export function PetCanvas() {
       interactionRef.current = null
       player?.destroy()
     }
+  }, [])
+
+  /** 弹一句现成的话（计时器之类），不走流式 */
+  const announce = useCallback((text: string) => {
+    const gen = ++sayGen.current
+    window.clearTimeout(hideTimer.current)
+    interactionRef.current?.startSay()
+    setBubble({ text, streaming: false })
+    interactionRef.current?.endSay()
+    hideTimer.current = window.setTimeout(() => {
+      if (gen === sayGen.current) setBubble(null)
+    }, hideDelayMs(text))
   }, [])
 
   const closeBubble = useCallback(() => {
