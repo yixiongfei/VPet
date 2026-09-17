@@ -168,6 +168,31 @@ pub fn reduce(s: &PetState, e: &Event) -> PetState {
     n
 }
 
+/// 关掉期间最多按这么久补算。
+///
+/// 这是产品判断不是技术判断：离线衰减的目的是「感觉时间过去了」，不是「你冷落了我」。
+/// 满饱腹跑到零只要 4 小时出头，所以上限必须明显短于它，否则每天早上打开都是一只
+/// 饿到脱力的宠物——那是愧疚感机制，docs/01 明确说了情绪引擎只正向放大、不惩罚。
+/// 按两小时补：回来时它可能正好去喝口水，不会奄奄一息。
+const MAX_CATCHUP_MIN: f32 = 2.0 * 60.0;
+
+/// 把「上次记录到现在」这段离线时间一次性补上。
+///
+/// 这是 `reduce` 保持纯函数换来的直接好处：补八小时和跑八小时走的是同一段代码，
+/// 不需要为「离线」单写一套衰减逻辑。
+pub fn catch_up(s: &PetState, now_ms: i64) -> PetState {
+    let minutes = (now_ms - s.updated_at).max(0) as f32 / 60_000.0;
+    if minutes < 1.0 {
+        return *s;
+    }
+    reduce(
+        s,
+        &Event::Tick {
+            minutes: minutes.min(MAX_CATCHUP_MIN),
+        },
+    )
+}
+
 /// 饿了 / 渴了就自己去吃喝。
 ///
 /// **只从 Idle / Break 触发**：专注（Working / Studying）不打断，睡觉不叫醒，
@@ -425,6 +450,44 @@ mod tests {
         assert!(ate, "十分钟里应该至少吃/喝过一次");
         assert_eq!(s.activity, Activity::Idle, "吃完该回空闲，不该卡在吃");
         assert!(s.hunger > HUNGRY_AT, "补完应该高于阈值");
+    }
+
+    #[test]
+    fn 离线期间照样会饿() {
+        let s = PetState {
+            updated_at: 0,
+            ..Default::default()
+        };
+        let after = catch_up(&s, 2 * 60 * 60 * 1000); // 关了两小时
+        assert!(after.hunger < s.hunger, "关掉期间也该掉饱腹");
+        assert!((after.hunger - (100.0 - 120.0 * HUNGER_PER_MIN)).abs() < 1.0);
+    }
+
+    #[test]
+    fn 离线太久不会把宠物饿死() {
+        let s = PetState {
+            updated_at: 0,
+            ..Default::default()
+        };
+        let three_days = 3 * 24 * 60 * 60 * 1000;
+        let after = catch_up(&s, three_days);
+        assert!(after.hunger > 0.0, "离线三天回来不该是一只饿到脱力的宠物");
+        assert!((after.hunger - (100.0 - MAX_CATCHUP_MIN * HUNGER_PER_MIN)).abs() < 1.0);
+        assert!(
+            after.mood != Mood::PoorCondition,
+            "长时间没开不该一上来就是坏心情——情绪只正向放大（docs/01）"
+        );
+    }
+
+    #[test]
+    fn 刚存过就重启不会重复扣() {
+        let s = PetState {
+            updated_at: 1_000,
+            hunger: 50.0,
+            ..Default::default()
+        };
+        let after = catch_up(&s, 1_500); // 才过去半秒
+        assert_eq!(after.hunger, 50.0);
     }
 
     #[test]

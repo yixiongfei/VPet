@@ -1,15 +1,17 @@
 //! VPet Core（Rust 侧）。
 //!
 //! 目前这里负责：宠物窗口的摆位与托盘、鼠标穿透的 alpha 命中判定、全局快捷键，
-//! 以及 `core/state_machine.rs` 的状态机和驱动它的心跳——数值随时间走、饿了自己去吃。
-//! 调度 / 工具 / 权限 / 存储还没做，见 docs/03-architecture.md §3 与 docs/07 Phase 2。
+//! 以及 `core/state_machine.rs` 的状态机和驱动它的心跳——数值随时间走、饿了自己去吃，
+//! 状态落在 `core/db.rs` 的 SQLite 里，重启能接着上次继续。
+//! 调度 / 番茄钟 / 工具 / 权限还没做，见 docs/03-architecture.md §3 与 docs/07 Phase 2。
 
 mod core;
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use core::state_machine::{reduce, Activity, Event, PetState, Touch};
+use core::db::Db;
+use core::state_machine::{catch_up, reduce, Activity, Event, PetState, Touch};
 
 use tauri::{
     menu::{CheckMenuItem, Menu, MenuItem},
@@ -37,6 +39,8 @@ const TICK: Duration = Duration::from_secs(1);
 const CONSUME: Duration = Duration::from_millis(2600);
 /// 活动和心情都没变时，最多隔这么久也要把数值同步给 Body 一次
 const SYNC_EVERY: Duration = Duration::from_secs(30);
+/// 状态落库的间隔。一分钟一条，掉电最多丢一分钟的数值
+const PERSIST_EVERY: Duration = Duration::from_secs(60);
 
 /// 鼠标穿透的判定状态。
 ///
@@ -140,6 +144,7 @@ fn now_ms() -> i64 {
 fn spawn_pet_clock(app: AppHandle) {
     std::thread::spawn(move || {
         let mut last_sync = Instant::now();
+        let mut last_persist = Instant::now();
         // 吃 / 喝 演了多久。放在这里而不是 PetState 里，是为了让 reduce 保持纯函数
         let mut consuming_since: Option<Instant> = None;
 
@@ -182,8 +187,60 @@ fn spawn_pet_clock(app: AppHandle) {
                 }
                 let _ = app.emit("pet:state", next);
             }
+            if last_persist.elapsed() >= PERSIST_EVERY {
+                last_persist = Instant::now();
+                persist(&app, &next);
+            }
         }
     });
+}
+
+/// 落一条状态流水。存不进去不该影响宠物继续跑——大不了这次的数值丢了
+fn persist(app: &AppHandle, s: &PetState) {
+    let Some(db) = app.try_state::<Mutex<Db>>() else { return };
+    let Ok(db) = db.lock() else { return };
+    if let Err(e) = db.record_pet_state(s) {
+        log::warn!("状态落库失败: {e}");
+    }
+}
+
+/// 开库、读回上次的状态、把关掉期间的时间补上。
+///
+/// 数据库打不开就在内存里跑（数值不留存），不该让宠物起不来。
+fn restore_state(app: &AppHandle) -> PetState {
+    let path = match app.path().app_data_dir() {
+        Ok(dir) => dir.join("vpet.db"),
+        Err(e) => {
+            log::warn!("拿不到数据目录，这次不落库: {e}");
+            return PetState::default();
+        }
+    };
+    let db = match Db::open(&path) {
+        Ok(db) => db,
+        Err(e) => {
+            log::warn!("数据库打不开，这次不落库: {e}");
+            return PetState::default();
+        }
+    };
+    let restored = match db.latest_pet_state() {
+        Ok(Some(s)) => {
+            let after = catch_up(&s, now_ms());
+            log::info!(
+                "读回上次状态（距今 {:.0} 分钟）：饱腹 {:.0} → {:.0}",
+                (now_ms() - s.updated_at) as f32 / 60_000.0,
+                s.hunger,
+                after.hunger
+            );
+            after
+        }
+        Ok(None) => PetState::default(),
+        Err(e) => {
+            log::warn!("读上次状态失败，按新宠物开始: {e}");
+            PetState::default()
+        }
+    };
+    app.manage(Mutex::new(db));
+    restored
 }
 
 /// Body 每换一帧推一次当前帧的 alpha 掩码（按位打包的 48×48）
@@ -213,8 +270,10 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(Mutex::new(HitState::default()))
-        .manage(Mutex::new(PetState::default()))
         .setup(|app| {
+            // 先把上次的状态读回来（含关掉期间的补算），再让心跳接手
+            let restored = restore_state(app.handle());
+            app.manage(Mutex::new(restored));
             if let Some(win) = app.get_webview_window(PET_WINDOW) {
                 place_bottom_right(&win);
             }
@@ -236,8 +295,20 @@ pub fn run() {
             set_hit_mask,
             set_hit_test_pinned
         ])
-        .run(tauri::generate_context!())
-        .expect("VPet 运行失败");
+        .build(tauri::generate_context!())
+        .expect("VPet 启动失败")
+        .run(|app, event| {
+            // 退出前再存一次，免得白丢最后这一分钟的数值
+            if matches!(event, tauri::RunEvent::Exit) {
+                if let Some(pet) = app.try_state::<Mutex<PetState>>() {
+                    let snapshot = pet.lock().map(|s| *s).ok();
+                    if let Some(mut s) = snapshot {
+                        s.updated_at = now_ms();
+                        persist(app, &s);
+                    }
+                }
+            }
+        });
 }
 
 /// 把窗口放到当前显示器右下角（留出任务栏）。Phase 1 会改为记住上次位置。
