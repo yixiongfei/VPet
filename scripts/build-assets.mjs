@@ -28,6 +28,9 @@ const SRC_ROOT = path.join(ROOT, 'assets-src', 'pet')
 const PET_DIR = path.join(SRC_ROOT, PET)
 const PET_LPS = path.join(SRC_ROOT, `${PET}.lps`)
 const OUT_DIR = path.join(ROOT, 'apps', 'desktop', 'public', 'pet')
+const FOOD_DIR = path.join(ROOT, 'assets-src', 'food')
+/** 食物精灵在 500 的画布里最宽也就 ~65 逻辑像素，128 够 2 倍屏用了 */
+const FOOD_SIZE = 128
 
 /** 与 packages/shared/src/manifest.ts 的 GRAPH_TYPES 同序（原版 GraphType 枚举顺序） */
 const GRAPH_TYPES = [
@@ -159,6 +162,9 @@ async function main() {
     })
   }
 
+  // 3.6 食物：夹心动画中间那层的图
+  const food = await buildFood()
+
   // 4. pet.json（vup.lps）
   const petJson = await fs
     .readFile(PET_LPS, 'utf8')
@@ -173,6 +179,7 @@ async function main() {
     clips: clips.map(({ _files, ...c }) => c),
     index,
     layered,
+    food,
   }
   if (!DRY) {
     await fs.writeFile(path.join(OUT_DIR, 'manifest.json'), JSON.stringify(manifest))
@@ -251,6 +258,64 @@ async function addClipFromFiles(dir, files, startup, line, out, isFile) {
     files: files.map((p) => ({ path: p, ms: frameMs(p) })),
   })
 }
+
+/**
+ * 食物：夹心动画中间那层。
+ *
+ * `assets-src/food/*.lps` 是原版的食物定义（名字 / 类型 / 用哪段动画 / 营养），
+ * 图片按名字对应 `assets-src/food/image/<名字>.png`。
+ * 只留 Body 和 Phase 2 的状态机用得到的字段——价格、经验、好感度是原版的养成经济，
+ * 这个产品里没有。
+ */
+async function buildFood() {
+  const lpsFiles = await fs.readdir(FOOD_DIR).catch(() => [])
+  const items = []
+  for (const f of lpsFiles.filter((f) => f.endsWith('.lps')).sort()) {
+    for (const line of parseLps(await fs.readFile(path.join(FOOD_DIR, f), 'utf8'))) {
+      if (line.name !== 'food') continue
+      const name = line.subs.name
+      const graph = (line.subs.graph ?? '').toLowerCase()
+      if (!name || !graph) continue
+      items.push({
+        name,
+        graph, // eat / drink / gift —— 决定用哪段夹心动画
+        type: line.subs.type ?? '',
+        strength: num(line.subs.Strength),
+        strengthFood: num(line.subs.StrengthFood),
+        strengthDrink: num(line.subs.StrengthDrink),
+        feeling: num(line.subs.Feeling),
+        health: num(line.subs.Health),
+        _src: path.join(FOOD_DIR, 'image', `${name}.png`),
+      })
+    }
+  }
+
+  const out = []
+  const outDir = path.join(OUT_DIR, 'food')
+  if (!DRY) await fs.mkdir(outDir, { recursive: true })
+  const sharp = DRY ? null : (await import('sharp')).default
+  let missing = 0
+  for (const [i, it] of items.entries()) {
+    if (!(await exists(it._src))) { missing++; continue }
+    const id = String(i).padStart(3, '0')
+    const src = `food/${id}.webp`
+    if (!DRY) {
+      const dst = path.join(OUT_DIR, src)
+      if (FORCE || !(await exists(dst))) {
+        await sharp(it._src)
+          .resize(FOOD_SIZE, FOOD_SIZE, { fit: 'inside', withoutEnlargement: true })
+          .webp({ quality: QUALITY })
+          .toFile(dst)
+      }
+    }
+    const { _src, ...rest } = it
+    out.push({ id, src, ...rest })
+  }
+  console.log(`食物：${out.length} 项${missing ? `（${missing} 项缺图，已跳过）` : ''}`)
+  return out
+}
+
+const num = (v) => (v === undefined ? 0 : Number.parseFloat(v) || 0)
 
 /**
  * 食物精灵的运动轨迹：`aN#时长,x,y,宽,旋转,不透明度`

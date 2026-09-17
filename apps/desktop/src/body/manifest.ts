@@ -1,6 +1,6 @@
 import {
   Manifest, MOOD_FALLBACK, clipKey, parsePetProfile,
-  type Animat, type GraphClip, type GraphType, type LayeredClip, type Mood, type PetProfile,
+  type Animat, type FoodItem, type GraphClip, type GraphType, type LayeredClip, type Mood, type PetProfile,
 } from '@vpet/shared'
 
 export const PET_BASE = '/pet'
@@ -41,6 +41,16 @@ export function resolveLayered(m: Manifest, type: GraphType, name: string, mood:
     if (hit) return hit
   }
   return undefined
+}
+
+/**
+ * 给一段夹心动画挑一样食物。`graph` 就是夹心动画的名字（eat / drink / gift）。
+ * 排掉 Drug——那是原版用来救存档的药，`太阳系` 一口下去体力 −100，自发进食不该吃它。
+ * Phase 2 起改由 Core 决定吃什么（吃什么决定回多少饱腹）。
+ */
+export function pickFood(m: Manifest, graph: string): FoodItem | undefined {
+  const usable = m.food.filter((f) => f.graph === graph && f.type !== 'Drug')
+  return usable.length ? pick(usable) : undefined
 }
 
 const idCache = new WeakMap<Manifest, Map<string, GraphClip>>()

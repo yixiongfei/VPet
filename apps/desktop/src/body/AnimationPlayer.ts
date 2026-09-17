@@ -1,5 +1,5 @@
-import type { Animat, GraphClip, GraphType, LayeredClip, Manifest, Mood } from '@vpet/shared'
-import { PET_BASE, byId, pick, resolveClips, resolveLayered } from './manifest'
+import { PET_LOGICAL_SIZE, type Animat, type FoodItem, type FoodKeyframe, type GraphClip, type GraphType, type LayeredClip, type Manifest, type Mood } from '@vpet/shared'
+import { PET_BASE, byId, pick, pickFood, resolveClips, resolveLayered } from './manifest'
 
 /**
  * 一条图层轨道。多层共用一个时钟（`elapsed`）：前后层帧数不同但总时长相同，
@@ -40,6 +40,9 @@ export class AnimationPlayer {
 
   private stepDone: (() => void) | null = null
   private layered: LayeredClip | null = null
+  /** 夹心中间那层：食物精灵 + 它自己的时间轴 */
+  private food: { item: FoodItem; bmp: ImageBitmap; keys: FoodKeyframe[]; cum: number[] } | null = null
+  private readonly foodCache = new Map<string, ImageBitmap>()
   private target: Required<PlayTarget> | null = null
   private phase: Phase = 'loop'
   /** 绘制顺序：后层 → 前层。tracks[0] 是主轨，它播完就算这一段播完 */
@@ -83,6 +86,7 @@ export class AnimationPlayer {
     this.stopping = false
     this.stepDone = null
     this.layered = null
+    this.food = null
 
     // 夹心动画（吃 / 喝 / 收礼）走两层轨道
     const layered = resolveLayered(this.manifest, this.target.type, this.target.name, this.target.mood)
@@ -143,6 +147,8 @@ export class AnimationPlayer {
     for (const frames of this.cache.values()) frames.forEach((b) => b.close())
     this.cache.clear()
     this.cachedBytes = 0
+    for (const b of this.foodCache.values()) b.close()
+    this.foodCache.clear()
   }
 
   /* ------------------------------------------------------------ */
@@ -166,10 +172,60 @@ export class AnimationPlayer {
       console.warn(`[AnimationPlayer] 夹心动画缺层：${l.id}`)
       return this.finish(gen)
     }
-    const tracks = await Promise.all([this.loadTrack(back), this.loadTrack(front)])
+    const item = pickFood(this.manifest, l.name)
+    const [tracks, bmp] = await Promise.all([
+      Promise.all([this.loadTrack(back), this.loadTrack(front)]),
+      item ? this.loadFoodImage(item) : Promise.resolve(null),
+    ])
     if (gen !== this.generation || this.destroyed) return
     this.layered = l
+    // 食物有自己的时间轴（和前后层的总时长不一定完全相等），超出就停在最后一段
+    let acc = 0
+    this.food = bmp && item ? { item, bmp, keys: l.food, cum: l.food.map((k) => (acc += k.ms)) } : null
     this.begin(tracks, phase)
+  }
+
+  private async loadFoodImage(item: FoodItem): Promise<ImageBitmap | null> {
+    const hit = this.foodCache.get(item.id)
+    if (hit) return hit
+    try {
+      const res = await fetch(`${PET_BASE}/${item.src}`)
+      if (!res.ok) throw new Error(String(res.status))
+      const bmp = await createImageBitmap(await res.blob())
+      this.foodCache.set(item.id, bmp)
+      return bmp
+    } catch (e) {
+      console.warn(`[AnimationPlayer] 食物图加载失败 ${item.name}`, e)
+      return null
+    }
+  }
+
+  /**
+   * 夹心中间那层。原版把图塞进一个 Width×Width 的方盒里（`Height = Width`）、
+   * 按比例内接，再整体旋转（FoodAnimation.Animation.Run）。
+   */
+  private drawFood(): void {
+    const f = this.food
+    if (!f) return
+    let i = 0
+    while (i < f.cum.length - 1 && this.elapsed >= f.cum[i]) i++
+    const k = f.keys[i]
+    if (!k?.visible || k.width === undefined || k.x === undefined || k.y === undefined) return
+
+    const unit = this.manifest.size / PET_LOGICAL_SIZE // 逻辑坐标 → 画布坐标
+    const box = k.width * unit
+    const scale = Math.min(box / f.bmp.width, box / f.bmp.height)
+    const w = f.bmp.width * scale
+    const h = f.bmp.height * scale
+    const cx = (k.x + k.width / 2) * unit
+    const cy = (k.y + k.width / 2) * unit
+
+    this.ctx.save()
+    this.ctx.globalAlpha = k.opacity ?? 1
+    this.ctx.translate(cx, cy)
+    if (k.rotate) this.ctx.rotate((k.rotate * Math.PI) / 180)
+    this.ctx.drawImage(f.bmp, -w / 2, -h / 2, w, h)
+    this.ctx.restore()
   }
 
   private begin(tracks: Track[], phase: Phase): void {
@@ -253,14 +309,15 @@ export class AnimationPlayer {
     if (gen === this.generation) this.onIdle?.()
   }
 
-  /** 后层 → 前层依次画上去（夹心的食物精灵层在两者之间，见 docs/05 §4） */
+  /** 后层 → 食物 → 前层，依次画上去（docs/05 §3 双图层） */
   private draw(): void {
     const s = this.manifest.size
     this.ctx.clearRect(0, 0, s, s)
-    for (const t of this.tracks) {
+    this.tracks.forEach((t, i) => {
       const bmp = t.frames[t.idx]
       if (bmp) this.ctx.drawImage(bmp, 0, 0, s, s)
-    }
+      if (i === 0) this.drawFood() // 后层之后、前层（手）之前
+    })
     this.onFrame?.(this.canvas)
   }
 

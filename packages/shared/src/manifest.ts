@@ -70,6 +70,28 @@ export const LayeredClip = z.object({
 })
 export type LayeredClip = z.infer<typeof LayeredClip>
 
+/**
+ * 食物：夹心动画中间那层的图 + Phase 2 状态机要用的营养值。
+ * 原版的价格/经验/好感度是养成经济，这个产品里没有，不带过来。
+ */
+export const FoodItem = z.object({
+  id: z.string(),
+  name: z.string(),
+  /** eat / drink / gift —— 决定配哪段夹心动画 */
+  graph: z.string(),
+  /** Meal / Snack / Drink / Drug / Gift / Functional */
+  type: z.string(),
+  src: z.string(),
+  strength: z.number(),
+  /** 回多少饱腹 */
+  strengthFood: z.number(),
+  /** 回多少水 */
+  strengthDrink: z.number(),
+  feeling: z.number(),
+  health: z.number(),
+})
+export type FoodItem = z.infer<typeof FoodItem>
+
 export const Manifest = z.object({
   pet: z.string(),
   size: z.number().int(),
@@ -79,6 +101,7 @@ export const Manifest = z.object({
   index: z.record(z.string(), z.array(z.string())),
   /** 夹心动画。数量很少（吃/喝/收礼 × 心情），查找直接线性找 */
   layered: z.array(LayeredClip).default([]),
+  food: z.array(FoodItem).default([]),
 })
 export type Manifest = z.infer<typeof Manifest>
 

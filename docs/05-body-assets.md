@@ -36,6 +36,8 @@ assets-src/pet/vup/**            ──→  apps/desktop/public/pet/
   ├─ 移植 GraphInfo 解析 → 每个叶子目录 = 一段动画（GraphClip）
   ├─ 读同目录 info.lps 覆盖字段（写一个 30 行的 LPS 解析器：`key#value:|` 按 `:|` 切、按 `#` 分）
   ├─ 解析 vup.lps → pet.json（touchhead/touchbody/pinch 区域、raisepoint、work 列表、move 规则、duration）
+  ├─ assets-src/food/*.lps + image/ → manifest.food（123 项：名字、eat/drink/gift、回多少饱腹/水、图）
+  │         图转 128px WebP（共 ~520 KB）。价格/经验/好感度是原版的养成经济，不带过来
   ├─ sharp：1000×1000 PNG → 500×500 WebP（quality 85，无损 alpha）    ≈ 836 MB → 60–90 MB
   │         （可选 --size=1000 出高清版，按显示缩放动态选）
   └─ manifest.json
@@ -68,6 +70,8 @@ interface Manifest { pet: 'vup'; size: 500; clips: GraphClip[]; index: Record<st
   原版 `FoodAnimation.cs` 的注释写得很直白：「第二层夹心为运行时提供」。
   `info.lps` 里 `FoodAnimation#eat:|a0#175,205,23,60,0,0.375:|…` 的 `aN` 就是食物精灵的轨迹：
   `时长,x,y,宽,旋转,不透明度`，只给一个值表示这段时间不显示。
+  精灵按原版放进一个 `宽×宽` 的方盒里等比内接（`Height = Width`），绕中心旋转。
+  **手在食物前面**，所以看起来是捧着吃——层序错了就穿帮。
   **前后两层帧数不同但总时长相同**（如 Eat/Nomal：后层 19 帧、前层 8 帧，都是 2625 ms），
   所以播放器用「一个时钟 + 每层各自的累计时间表反查帧号」，而不是每层一个游标——后者会漂移。
 - **Body 不决定播什么**。它订阅 `pet:state`，用一张纯数据的映射表：
