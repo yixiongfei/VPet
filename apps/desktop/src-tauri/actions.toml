@@ -272,3 +272,17 @@ cooldown = 90
 hours = [[12, 14], [19, 23]]
 per_min = { strength = -0.2, hunger = -0.05, thirst = 0.0, feeling = 1.0 }
 requires = { level = 18, min_strength = 20 }
+
+# ---------- 收礼：用户送的，不花她的钱 ----------
+# 走 give_gift 命令触发（托盘菜单），不进 decide 的自动挑选——
+# 礼物是「别人给的」，她自己不会凭空收到一个
+
+[[action]]
+id = "gift"
+name = "收礼物"
+activity = "gift"
+graph = "gift"
+tags = ["gift"]
+duration = 3
+cooldown = 0
+per_min = { strength = 0.2, hunger = 0.0, thirst = 0.0, feeling = 0.0 }

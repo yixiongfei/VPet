@@ -8,6 +8,8 @@ export const Activity = z.enum([
   'idle', 'working', 'break', 'studying', 'sleeping', 'playing',
   /** 饱腹/口渴掉到阈值以下时由 Core 触发，播夹心动画（后层宠物 → 食物 → 前层手） */
   'eating', 'drinking',
+  /** 收礼物。由用户从托盘触发，她自己不会凭空收到 */
+  'gift',
 ])
 export type Activity = z.infer<typeof Activity>
 

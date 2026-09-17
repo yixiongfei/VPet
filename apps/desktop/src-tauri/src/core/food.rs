@@ -59,6 +59,20 @@ impl FoodShelf {
         self.items.iter().find(|f| f.id == id)
     }
 
+    /// 随机挑一件（礼物用）。`seed` 由调用方给——状态机要保持纯函数，
+    /// 随机数不能长在里面
+    pub fn random(&self, graph: &str, seed: u64) -> Option<&FoodItem> {
+        let pool: Vec<&FoodItem> = self
+            .items
+            .iter()
+            .filter(|f| f.graph == graph && f.kind != "Drug")
+            .collect();
+        if pool.is_empty() {
+            return None;
+        }
+        Some(pool[(seed as usize) % pool.len()])
+    }
+
     /// 按需求和钱包挑一样。买不起就返回 None，调用方自己决定怎么办。
     ///
     /// `graph` 是「吃」还是「喝」，和夹心动画对应。
@@ -117,6 +131,28 @@ mod tests {
             item("poison", "eat", "Drug", 90.0, 0.0, 0.0, 1.0),
         ]);
         s
+    }
+
+    #[test]
+    fn 随机挑礼物不会挑到空也不会挑到药() {
+        let mut s = shelf();
+        s.set(vec![
+            item("g1", "gift", "Gift", 0.0, 0.0, 100.0, 500.0),
+            item("g2", "gift", "Gift", 0.0, 0.0, 200.0, 900.0),
+            item("bad", "gift", "Drug", 0.0, 0.0, 0.0, 1.0),
+        ]);
+        let mut seen = std::collections::HashSet::new();
+        for seed in 0..20u64 {
+            let f = s.random("gift", seed).unwrap();
+            assert_ne!(f.kind, "Drug");
+            seen.insert(f.id.clone());
+        }
+        assert!(seen.len() > 1, "二十次都挑到同一件，等于没随机");
+    }
+
+    #[test]
+    fn 货架空了送不出礼物() {
+        assert!(FoodShelf::default().random("gift", 0).is_none());
     }
 
     #[test]

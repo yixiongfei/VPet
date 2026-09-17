@@ -259,6 +259,22 @@ fn restore_state(app: &AppHandle, cat: &Catalog, shelf: &FoodShelf) -> Pet {
     restored
 }
 
+/// 用户送她一样礼物。随机挑一件——拆盲盒比让人从二十项里选更有意思。
+/// 礼物不花她的钱，钱是用户出的。
+#[tauri::command]
+fn give_gift(app: AppHandle) -> Option<String> {
+    let shelf = app.state::<RwLock<FoodShelf>>();
+    let picked = {
+        let Ok(s) = shelf.read() else { return None };
+        s.random("gift", now_ms() as u64)
+            .map(|f| (f.id.clone(), f.name.clone()))
+    };
+    let (id, name) = picked?;
+    log::info!("收到礼物：{name}");
+    apply(&app, &Event::Gifted { id, name: name.clone() });
+    Some(name)
+}
+
 /// Body 启动时把食物目录交给 Core。
 ///
 /// 123 项食物是 build-assets 从原版 `food/*.lps` 转出来的，躺在 Body 的 manifest 里；
@@ -329,7 +345,8 @@ pub fn run() {
             debug_patch_pet_state,
             set_hit_mask,
             set_hit_test_pinned,
-            set_food_catalog
+            set_food_catalog,
+            give_gift
         ])
         .build(tauri::generate_context!())
         .expect("VPet 启动失败")
@@ -368,8 +385,9 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let toggle = MenuItem::with_id(app, "toggle", "显示 / 隐藏", true, None::<&str>)?;
     // 穿透在 Windows 上是有坑的一项（docs/07 风险表），留个能当场关掉的开关
     let passthrough = CheckMenuItem::with_id(app, "passthrough", "鼠标穿透", true, true, None::<&str>)?;
+    let gift = MenuItem::with_id(app, "gift", "送她礼物", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&toggle, &passthrough, &quit])?;
+    let menu = Menu::with_items(app, &[&toggle, &gift, &passthrough, &quit])?;
 
     let mut builder = TrayIconBuilder::with_id("main")
         .menu(&menu)
@@ -377,6 +395,9 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         .tooltip("VPet")
         .on_menu_event(|app, event| match event.id().as_ref() {
             "toggle" => toggle_pet(app),
+            "gift" => {
+                give_gift(app.clone());
+            }
             "passthrough" => toggle_passthrough(app),
             "quit" => app.exit(0),
             _ => {}

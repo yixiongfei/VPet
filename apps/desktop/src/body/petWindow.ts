@@ -24,6 +24,9 @@ export const reportTouch = (zone: string) => void invokeCore('pet_touched', { zo
  */
 export const pushFoodCatalog = (items: unknown[]) => void invokeCore('set_food_catalog', { items })
 
+/** 送她一样礼物（随机挑一件）。返回礼物名字，没货架时返回 null */
+export const giveGift = () => invokeCore<string>('give_gift')
+
 /**
  * 按逻辑像素平移宠物窗口——提起时用来让窗口跟住光标。
  * 浏览器预览里没有 Tauri，静默跳过（动画照常，只是窗口不动）。

@@ -32,12 +32,14 @@ pub enum Activity {
     Playing,
     Eating,
     Drinking,
+    /// 收礼物。和吃喝一样是过场，不该被打断
+    Gift,
 }
 
 impl Activity {
     /// 过场动画，不该被新的决策打断（正在把饭往嘴里送，不能突然去上班）
     pub fn is_transient(self) -> bool {
-        matches!(self, Activity::Eating | Activity::Drinking)
+        matches!(self, Activity::Eating | Activity::Drinking | Activity::Gift)
     }
 }
 
@@ -127,11 +129,13 @@ pub enum Touch {
     Raise,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     /// 时间流逝。`hour` 是当前钟点（0–24），决定「到点该做什么」
     Tick { minutes: f32, hour: f32 },
     Touched(Touch),
+    /// 用户送了样东西。她自己不会凭空收到礼物，所以这条只能从外面来
+    Gifted { id: String, name: String },
     /// 调试用：直接改数值，用来验证阈值行为
     Patch {
         strength: Option<f32>,
@@ -208,6 +212,24 @@ pub fn reduce(cat: &Catalog, shelf: &FoodShelf, p: &Pet, e: &Event) -> Pet {
     let mut n = p.clone();
     match e {
         Event::Tick { minutes, hour } => tick(cat, shelf, &mut n, minutes.max(0.0), *hour),
+        Event::Gifted { id, name } => {
+            // 收礼不走 decide：礼物是别人给的，不是她自己挑的
+            if let Some(a) = cat.get("gift") {
+                n.state.activity = a.activity;
+                n.state.action = Some(ActionRef {
+                    id: a.id.clone(),
+                    name: a.name.clone(),
+                    graph: a.graph.clone(),
+                    reason: "收到礼物了".into(),
+                    food: Some(FoodRef {
+                        id: id.clone(),
+                        name: name.clone(),
+                    }),
+                });
+                n.elapsed = 0.0;
+                n.earned = 0.0;
+            }
+        }
         Event::Touched(t) => {
             n.state.feeling += match t {
                 Touch::Head => FEELING_HEAD,
@@ -266,11 +288,14 @@ fn tick(cat: &Catalog, shelf: &FoodShelf, n: &mut Pet, minutes: f32, hour: f32) 
         Some(f) => match shelf.get(&f.id) {
             Some(item) => {
                 let dur = current.duration.max(0.01);
-                (
-                    item.strength_food / dur,
-                    item.strength_drink / dur,
-                    item.feeling / dur,
-                )
+                // 礼物的 feeling 是原版的大尺度（30~1790，原版上限随等级涨），
+                // 缩到我们的 0–100 上：便宜的聊胜于无，贵的直接把心情拉满
+                let feel = if item.kind == "Gift" {
+                    item.feeling / 10.0
+                } else {
+                    item.feeling
+                };
+                (item.strength_food / dur, item.strength_drink / dur, feel / dur)
             }
             None => (d.hunger, d.thirst, d.feeling),
         },
@@ -928,6 +953,66 @@ mod tests {
         let c = cat();
         let p = run_with(&c, &stocked(), Pet::default(), 24 * 60, 0.0);
         assert!(p.state.money > 0.0, "忙活一整天最后一分钱不剩，经济尺度不对");
+    }
+
+    #[test]
+    fn 收礼物会涨心情而且不花她的钱() {
+        let c = cat();
+        let mut sh = stocked();
+        {
+            use super::super::food::FoodItem;
+            sh.set(vec![FoodItem {
+                id: "phone".into(),
+                name: "APhone X".into(),
+                graph: "gift".into(),
+                kind: "Gift".into(),
+                strength: 0.0,
+                strength_food: 0.0,
+                strength_drink: 0.0,
+                feeling: 290.0,
+                health: 0.0,
+                price: 974.0,
+            }]);
+        }
+        let mut p = Pet::default();
+        p.state.feeling = 20.0;
+        p.state.money = 10.0;
+        let money_before = p.state.money;
+
+        p = reduce(&c, &sh, &p, &Event::Gifted { id: "phone".into(), name: "APhone X".into() });
+        assert_eq!(p.state.activity, Activity::Gift);
+        assert_eq!(p.state.action.as_ref().unwrap().food.as_ref().unwrap().id, "phone");
+
+        p = run_with(&c, &sh, p, 3, 15.0);
+        assert!(p.state.feeling > 20.0, "收了礼物心情没变：{}", p.state.feeling);
+        assert_eq!(p.state.money, money_before, "礼物是用户送的，不该扣她的钱");
+    }
+
+    #[test]
+    fn 收礼物过程中不会被打断() {
+        let c = cat();
+        let mut p = Pet::default();
+        p.state.hunger = 5.0; // 就算饿着
+        p = reduce(&c, &shelf(), &p, &Event::Gifted { id: "x".into(), name: "礼物".into() });
+        p = reduce(&c, &shelf(), &p, &Event::Tick { minutes: 0.5, hour: 12.0 });
+        assert_eq!(p.state.activity, Activity::Gift, "拆礼物拆到一半不该跑去吃饭");
+    }
+
+    #[test]
+    fn 她自己不会凭空收到礼物() {
+        let c = cat();
+        let sh = stocked();
+        // 跑一整天，decide 永远不该挑中 gift
+        let mut p = Pet::default();
+        for i in 0..(24 * 60) {
+            let hour = (i as f32 / 60.0) % 24.0;
+            p = reduce(&c, &sh, &p, &Event::Tick { minutes: 1.0, hour });
+            assert_ne!(
+                p.state.activity,
+                Activity::Gift,
+                "礼物得是别人给的，不能自己长出来"
+            );
+        }
     }
 
     #[test]
